@@ -1,0 +1,264 @@
+/* --- RESPONSIVE DESIGN FOUNDATION --- */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Inter', sans-serif;
+    -webkit-font-smoothing: antialiased;
+    margin: 0;
+    padding: 0;
+}
+
+html, body {
+    overflow-x: hidden;
+}
+
+/* --- SCROLLBAR --- */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #cbd5e1;
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #94a3b8;
+}
+
+/* --- UTILITIES --- */
+.hidden {
+    display: none !important;
+}
+
+/* --- SIDEBAR ANIMATIONS --- */
+#sidebar {
+    box-shadow: -1px 0 3px rgba(0, 0, 0, 0.1);
+}
+
+#sidebar.active {
+    transform: translateX(0);
+}
+
+/* Desktop Sidebar Collapse */
+@media (min-width: 1024px) {
+    #sidebar.collapsed {
+        width: 4rem; /* 64px - icon-only mode */
+    }
+
+    #sidebar.collapsed h2,
+    #sidebar.collapsed span:not([class*="text-"]),
+    #sidebar.collapsed nav a span:last-child,
+    #sidebar.collapsed .flex-grow + div {
+        display: none;
+    }
+
+    #sidebar.collapsed .flex-grow {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.5rem;
+    }
+
+    #sidebar.collapsed nav a {
+        justify-content: center;
+        padding: 0.75rem;
+    }
+
+    #sidebar.collapsed nav a span:first-child {
+        margin: 0 !important;
+    }
+}
+
+#sidebarOverlay {
+    transition: opacity 0.3s ease, visibility 0.3s ease;
+}
+
+#sidebarOverlay.active {
+    opacity: 0.5 !important;
+    display: block;
+}
+
+/* --- MODAL ANIMATIONS --- */
+.modal {
+    transition: opacity 0.25s ease, visibility 0.25s ease;
+}
+
+.modal.active {
+    opacity: 1 !important;
+    pointer-events: auto !important;
+    visibility: visible !important;
+}
+
+.modal-overlay {
+    backdrop-filter: blur(4px);
+}
+
+/* --- RESPONSIVE TYPOGRAPHY --- */
+@media (max-width: 640px) {
+    h1 {
+        font-size: 1.25rem;
+    }
+
+    h2 {
+        font-size: 1.5rem;
+    }
+
+    h3 {
+        font-size: 1rem;
+    }
+}
+
+/* --- NAVIGATION ACTIVE STATE --- */
+.nav-active {
+    background-color: #f1f5f9; /* slate-100 */
+    color: #020617; /* slate-950 */
+}
+
+/* --- TABLE RESPONSIVE --- */
+@media (max-width: 768px) {
+    table {
+        font-size: 0.875rem;
+    }
+
+    td, th {
+        padding: 0.5rem !important;
+    }
+}
+
+/* --- GRID RESPONSIVE --- */
+@media (max-width: 768px) {
+    .grid {
+        gap: 1rem !important;
+    }
+}
+
+/* --- BUTTONS RESPONSIVE --- */
+@media (max-width: 640px) {
+    button {
+        min-height: 44px;
+        font-size: 0.875rem;
+    }
+}
+
+/* --- INPUT FOCUS STATES --- */
+input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: #1e293b;
+    box-shadow: 0 0 0 3px rgba(30, 41, 59, 0.1);
+}
+
+/* --- SMOOTH TRANSITIONS --- */
+* {
+    transition-property: background-color, border-color, color, fill, stroke;
+    transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+    transition-duration: 150ms;
+}
+
+/* --- DISABLE TRANSITION ON ACTIVE --- */
+.notransition {
+    transition: none !important;
+}
+
+/* --- ACCESSIBILITY --- */
+@media (prefers-reduced-motion: reduce) {
+    * {
+        animation-duration: 0.01ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important;
+    }
+}
+
+/* --- PRINT STYLES --- */
+@media print {
+    nav, aside, #sidebarToggle, button {
+        display: none !important;
+    }
+
+    main {
+        margin: 0;
+        padding: 0;
+    }
+}
+
+/* --- DARK MODE SUPPORT (Optional) --- */
+@media (prefers-color-scheme: dark) {
+    /* Add dark mode styles here if needed */
+}
+
+/* --- MOBILE FIRST APPROACH --- */
+@media (max-width: 640px) {
+    /* Extra small devices */
+    body {
+        font-size: 14px;
+    }
+}
+
+@media (min-width: 641px) and (max-width: 1024px) {
+    /* Medium devices */
+    body {
+        font-size: 15px;
+    }
+}
+
+@media (min-width: 1025px) {
+    /* Large devices */
+    body {
+        font-size: 16px;
+    }
+}
+
+/* --- SIDEBAR MOBILE BEHAVIOR --- */
+@media (max-width: 1023px) {
+    #sidebar {
+        max-width: 90vw;
+        width: 18rem;
+    }
+}
+
+@media (min-width: 1024px) {
+    #sidebar {
+        width: 18rem;
+        transform: translateX(0) !important;
+    }
+
+    #sidebarOverlay {
+        display: none !important;
+    }
+}
+
+/* --- MODAL RESPONSIVE --- */
+@media (max-width: 640px) {
+    .modal-container {
+        width: 95vw !important;
+        max-height: 90vh;
+    }
+}
+
+/* --- CONTAINER PADDING --- */
+@media (max-width: 640px) {
+    main {
+        padding: 0 0.5rem;
+    }
+}
+
+@media (min-width: 641px) and (max-width: 1024px) {
+    main {
+        padding: 0 1rem;
+    }
+}
+
+@media (min-width: 1025px) {
+    main {
+        padding: 0 2rem;
+    }
+}

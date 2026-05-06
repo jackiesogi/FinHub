@@ -76,7 +76,12 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse, tags=["Frontend"])
 async def home(request: Request):
-    # TemplateResponse expects (request, name, context)
+    # ✅ 新的響應式設計
+    return templates.TemplateResponse(request, "index_responsive.html")
+
+@app.get("/classic", response_class=HTMLResponse, tags=["Frontend"])
+async def home_classic(request: Request):
+    # 舊版設計（備用）
     return templates.TemplateResponse(request, "index.html")
 
 @app.get("/login", response_class=HTMLResponse, tags=["Frontend"])

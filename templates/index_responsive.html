@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FinTechHub | Secure Ledger</title>
+    <link rel="stylesheet" href="/static/style_responsive.css">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body class="bg-[#f8fafc] text-slate-900 min-h-screen">
+
+    <!-- Top Navigation Bar -->
+    <nav class="bg-white/80 backdrop-blur-md border-b border-slate-100 sticky top-0 z-40 px-4 md:px-6 py-3 md:py-4 flex justify-between items-center">
+        <div class="flex items-center space-x-2 md:space-x-4">
+            <!-- Sidebar Toggle Button (Mobile) -->
+            <button id="sidebarToggle" onclick="toggleSidebar()" class="p-2 hover:bg-slate-100 rounded-lg transition lg:hidden">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                </svg>
+            </button>
+
+            <!-- Sidebar Toggle Button (Desktop) -->
+            <button id="sidebarToggleDesktop" onclick="toggleSidebarDesktop()" class="hidden lg:block p-2 hover:bg-slate-100 rounded-lg transition">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                </svg>
+            </button>
+
+            <!-- Logo & Branding in Nav -->
+            <div class="flex items-center space-x-3">
+                <div class="w-8 h-8 bg-slate-900 rounded-lg flex items-center justify-center shadow-lg text-white font-bold text-sm">FH</div>
+                <div class="flex flex-col">
+                    <span class="text-lg font-extrabold tracking-tight">FinHub</span>
+                    <span class="text-[10px] text-slate-400 font-medium">Financial Management</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Header Controls (Right) -->
+        <div class="flex items-center space-x-2 md:space-x-4">
+            <select id="headerAccountFilter" onchange="currentPage=1; applyFilter(); updateAccountUI(allAccounts);"
+                    class="hidden md:block bg-slate-50 border border-slate-200 text-xs font-semibold rounded-lg px-2 md:px-3 py-1.5 outline-none">
+                <option value="all">ALL ACCOUNTS</option>
+            </select>
+        </div>
+    </nav>
+
+    <!-- Main Container -->
+    <div class="flex h-[calc(100vh-64px)] md:h-[calc(100vh-68px)]">
+
+        <!-- Sidebar (Collapsible) -->
+        <aside id="sidebar" class="fixed md:relative w-72 max-w-[90vw] h-full bg-white border-r border-slate-200 p-4 md:p-6 flex flex-col
+                    transform transition-transform duration-300 ease-in-out -translate-x-full md:translate-x-0 z-30
+                    overflow-y-auto shadow-lg md:shadow-none md:transition-all md:duration-300">
+
+            <!-- Sidebar Header with Close Button (Mobile) & Collapse Button (Desktop) -->
+            <div class="flex items-center justify-between mb-8 md:mb-10">
+                <h2 class="text-sm font-bold text-slate-400 uppercase tracking-widest">Quick Access</h2>
+                <!-- Close Button (Mobile Only) -->
+                <button onclick="toggleSidebar()" class="p-2 hover:bg-slate-100 rounded-lg transition md:hidden">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Navigation Menu -->
+            <nav class="space-y-1.5 flex-grow">
+                <a href="#" onclick="showSection('dashboard')" id="nav-dashboard"
+                   class="flex items-center space-x-3 px-3 md:px-4 py-2.5 bg-slate-100 rounded-lg font-semibold text-slate-950 hover:bg-slate-200 transition">
+                    <span>📊</span><span>Dashboard</span>
+                </a>
+                <a href="#" onclick="showSection('audit')" id="nav-audit"
+                   class="flex items-center space-x-3 px-3 md:px-4 py-2.5 rounded-lg font-semibold text-slate-500 hover:bg-slate-50 transition">
+                    <span>🛡️</span><span>Security Logs</span>
+                </a>
+            </nav>
+
+            <!-- Accounts Section -->
+            <div class="mt-6 md:mt-8 mb-6 bg-slate-50 p-4 md:p-5 rounded-2xl border border-slate-100 space-y-4">
+                <div class="flex justify-between items-center">
+                    <h4 class="text-[10px] font-bold text-slate-400 uppercase tracking-widest">My Accounts</h4>
+                    <button onclick="selectAccountFromSidebar('all')"
+                            class="text-[9px] font-bold text-indigo-500 hover:underline">SHOW ALL</button>
+                </div>
+                <div id="accountBalances" class="space-y-2 max-h-32 md:max-h-40 overflow-y-auto"></div>
+                <button onclick="toggleAccountModal()"
+                        class="w-full text-xs font-bold text-slate-600 bg-white border border-slate-200 py-2 rounded-lg hover:bg-slate-50 shadow-sm transition">
+                    + New Account
+                </button>
+                <button onclick="toggleTransferModal()"
+                        class="w-full text-xs font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 py-2 rounded-lg hover:bg-indigo-100 transition">
+                    ⇄ Transfer
+                </button>
+            </div>
+
+            <!-- User Profile Section -->
+            <div class="bg-slate-900 p-4 md:p-5 rounded-2xl text-white">
+                <div class="font-bold text-sm" id="currentUserDisplay">Loading...</div>
+                <button onclick="logout()"
+                        class="text-xs text-red-400 font-bold mt-2 hover:underline uppercase transition">
+                    Terminate Session
+                </button>
+            </div>
+        </aside>
+
+        <!-- Sidebar Overlay (Mobile) -->
+        <div id="sidebarOverlay" onclick="toggleSidebar()"
+             class="hidden md:hidden fixed inset-0 bg-slate-900 opacity-0 transition-opacity z-20"></div>
+
+        <!-- Main Content Area -->
+        <main class="flex-1 overflow-y-auto w-full">
+
+            <!-- Dashboard Section -->
+            <div id="section-dashboard" class="px-4 md:px-6 lg:px-8 py-6 md:py-8 space-y-6 md:space-y-8">
+
+                <!-- Dashboard Toolbar -->
+                <section class="bg-white px-4 md:px-6 py-4 rounded-2xl border border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                    <div>
+                        <h2 id="pageTitle" class="text-lg md:text-2xl font-bold text-slate-900">Financial Dashboard</h2>
+                        <p class="text-xs text-slate-500 mt-1">Manage your accounts and transactions</p>
+                    </div>
+                    <button id="addEntryBtn" onclick="toggleModal()"
+                            class="px-4 md:px-6 py-2.5 text-sm font-bold text-white bg-slate-900 rounded-lg shadow-md hover:bg-slate-800 transition w-full sm:w-auto">
+                        ✨ Add Entry
+                    </button>
+                </section>
+
+                <!-- KPI Cards -->
+                <section class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 md:gap-6">
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+                        <p class="text-[10px] font-bold text-slate-400 uppercase mb-2">Total Net Worth</p>
+                        <div class="text-2xl md:text-3xl font-black" id="statBalance">$0</div>
+                    </div>
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 border-l-4 border-l-emerald-500">
+                        <p class="text-[10px] font-bold text-emerald-500 uppercase mb-2">Total Income</p>
+                        <div class="text-2xl md:text-3xl font-black text-emerald-600" id="statIncome">+$0</div>
+                    </div>
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 border-l-4 border-l-red-500">
+                        <p class="text-[10px] font-bold text-red-400 uppercase mb-2">Total Expense</p>
+                        <div class="text-2xl md:text-3xl font-black text-red-600" id="statExpense">-$0</div>
+                    </div>
+                </section>
+
+                <!-- Charts Section -->
+                <section class="grid grid-cols-1 lg:grid-cols-3 gap-4 md:gap-6">
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border h-80 md:h-96 flex flex-col">
+                        <h3 class="text-xs font-bold text-slate-400 mb-4 uppercase">Allocation</h3>
+                        <div class="flex-grow relative"><canvas id="categoryChart"></canvas></div>
+                    </div>
+                    <div class="lg:col-span-2 bg-white p-4 md:p-6 rounded-2xl border h-80 md:h-96 flex flex-col">
+                        <h3 class="text-xs font-bold text-slate-400 mb-4 uppercase">Flow</h3>
+                        <div class="flex-grow relative"><canvas id="trendChart"></canvas></div>
+                    </div>
+                </section>
+
+                <!-- Filter Section -->
+                <section class="bg-white px-4 md:px-8 py-4 rounded-t-2xl border border-slate-200 flex flex-col md:flex-row justify-between items-start md:items-center gap-3">
+                    <div class="flex flex-col md:flex-row items-start md:items-center space-y-2 md:space-y-0 md:space-x-3 w-full md:w-auto">
+                        <input type="date" id="startDate" class="text-xs font-semibold bg-slate-50 border rounded-lg px-2 md:px-3 py-1.5 outline-none flex-1 md:flex-none">
+                        <input type="date" id="endDate" class="text-xs font-semibold bg-slate-50 border rounded-lg px-2 md:px-3 py-1.5 outline-none flex-1 md:flex-none">
+                        <button onclick="currentPage=1; applyFilter()"
+                                class="bg-slate-100 text-slate-600 px-3 py-1.5 rounded-lg text-[10px] font-black uppercase hover:bg-slate-200 transition w-full md:w-auto">
+                            Apply Filter
+                        </button>
+                    </div>
+                    <button onclick="exportCSV()"
+                            class="flex items-center justify-center md:justify-start space-x-2 bg-emerald-50 text-emerald-600 px-4 py-2 rounded-xl text-[10px] font-black border border-emerald-100 uppercase hover:bg-emerald-100 transition w-full md:w-auto">
+                        📥 Export CSV
+                    </button>
+                </section>
+
+                <!-- Transactions Table -->
+                <section class="bg-white border border-slate-200 shadow-sm rounded-b-2xl overflow-x-auto">
+                    <table class="w-full text-left text-sm">
+                        <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase border-b">
+                            <tr>
+                                <th class="px-4 md:px-8 py-3 cursor-pointer hover:bg-slate-100" onclick="toggleSort('date')">Date ↕</th>
+                                <th class="px-4 md:px-8 py-3">Description</th>
+                                <th class="hidden md:table-cell px-4 md:px-8 py-3">Category</th>
+                                <th class="px-4 md:px-8 py-3 text-right cursor-pointer hover:bg-slate-100" onclick="toggleSort('amount')">Amount ↕</th>
+                                <th class="px-4 md:px-8 py-3 text-right">Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="transactionTable" class="text-sm divide-y divide-slate-100"></tbody>
+                    </table>
+                    <div class="flex flex-col md:flex-row items-center justify-between px-4 md:px-8 py-4 bg-slate-50 border-t rounded-b-2xl gap-3">
+                        <span class="text-[10px] font-bold text-slate-400 uppercase" id="pageInfo">Page 1 of 1</span>
+                        <div class="flex space-x-2">
+                            <button id="prevBtn" onclick="changePage(-1)"
+                                    class="px-3 py-1 text-[10px] font-black bg-white border rounded-lg disabled:opacity-30 hover:bg-slate-50 transition">
+                                Prev
+                            </button>
+                            <button id="nextBtn" onclick="changePage(1)"
+                                    class="px-3 py-1 text-[10px] font-black bg-white border rounded-lg disabled:opacity-30 hover:bg-slate-50 transition">
+                                Next
+                            </button>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Security Audit Section -->
+            <div id="section-audit" class="px-4 md:px-6 lg:px-8 py-6 md:py-8 space-y-6 hidden">
+                <h2 class="text-2xl font-black text-slate-900">Security Audit Trail</h2>
+                <div class="bg-white border rounded-2xl overflow-x-auto shadow-sm">
+                    <table class="w-full text-left text-sm">
+                        <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase border-b">
+                            <tr>
+                                <th class="px-4 md:px-8 py-4">Timestamp</th>
+                                <th class="hidden md:table-cell px-4 md:px-8 py-4">Operation</th>
+                                <th class="px-4 md:px-8 py-4">Target</th>
+                                <th class="hidden lg:table-cell px-4 md:px-8 py-4">Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="auditLogTable" class="divide-y"></tbody>
+                    </table>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Transaction Modal -->
+    <div id="modal" class="modal opacity-0 pointer-events-none fixed w-full h-full top-0 left-0 flex items-center justify-center z-50">
+        <div class="modal-overlay absolute w-full h-full bg-slate-900 opacity-40"></div>
+        <div class="modal-container bg-white w-[95%] sm:w-[90%] md:max-w-md mx-auto rounded-[32px] shadow-2xl z-50 overflow-hidden max-h-[90vh] overflow-y-auto">
+            <div class="modal-content py-6 md:py-8 px-6 md:px-10">
+                <h2 id="modalTitle" class="text-xl md:text-2xl font-black text-slate-900 mb-6">New Entry</h2>
+                <form id="transactionForm" class="space-y-4">
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Account</label>
+                        <select id="accountSelect" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-medium outline-none focus:ring-2 focus:ring-slate-900" required></select>
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Date</label>
+                        <input type="date" id="txDate" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-medium outline-none focus:ring-2 focus:ring-slate-900" required>
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Description</label>
+                        <input type="text" id="desc" placeholder="e.g. Starbucks Coffee" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-medium outline-none focus:ring-2 focus:ring-slate-900" required>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Amount</label>
+                            <input type="number" step="0.01" id="amt" placeholder="0.00" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold text-slate-900 outline-none focus:ring-2 focus:ring-slate-900" required>
+                        </div>
+                        <div>
+                            <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Type</label>
+                            <select id="type" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-slate-900">
+                                <option value="income">Income</option>
+                                <option value="expense" selected>Expense</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div>
+                        <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Category</label>
+                        <input type="text" id="cat" placeholder="e.g. Food" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-medium outline-none focus:ring-2 focus:ring-slate-900">
+                    </div>
+                    <button type="submit" id="submitTxBtn" class="w-full bg-slate-900 text-white font-bold py-3 md:py-4 rounded-2xl mt-4 hover:bg-slate-800 shadow-lg transition-all text-base md:text-lg">
+                        Confirm Transaction
+                    </button>
+                    <button type="button" onclick="toggleModal()" class="w-full text-slate-400 text-xs font-bold mt-2 uppercase tracking-widest hover:text-slate-500 transition">
+                        Cancel
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <!-- Account Modal -->
+    <div id="accountModal" class="modal opacity-0 pointer-events-none fixed w-full h-full top-0 left-0 flex items-center justify-center z-50">
+        <div class="modal-overlay absolute w-full h-full bg-slate-900 opacity-40"></div>
+        <div class="modal-container bg-white w-[95%] sm:w-[90%] md:max-w-md mx-auto rounded-2xl p-6 md:p-8 z-50">
+            <form id="accountForm" class="space-y-4">
+                <p class="text-lg md:text-xl font-bold">New Account</p>
+                <input type="text" id="accName" placeholder="Account Name" class="w-full p-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none" required>
+                <input type="number" step="0.01" id="accBalance" value="0.00" class="w-full p-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none" required>
+                <select id="accType" class="w-full p-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none">
+                    <option value="Checking">Checking</option>
+                    <option value="Savings">Savings</option>
+                    <option value="Cash">Cash</option>
+                </select>
+                <button type="submit" class="w-full bg-slate-900 text-white font-bold py-3 rounded-xl hover:bg-slate-800 transition">
+                    Create
+                </button>
+                <button type="button" onclick="toggleAccountModal()" class="w-full text-slate-400 text-xs mt-2 uppercase hover:text-slate-500 transition">
+                    CANCEL
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Transfer Modal -->
+    <div id="transferModal" class="modal opacity-0 pointer-events-none fixed w-full h-full top-0 left-0 flex items-center justify-center z-50">
+        <div class="modal-overlay absolute w-full h-full bg-slate-900 opacity-40"></div>
+        <div class="modal-container bg-white w-[95%] sm:w-[90%] md:max-w-md mx-auto rounded-2xl p-6 md:p-8 z-50">
+            <form id="transferForm" class="space-y-4">
+                <p class="text-lg md:text-xl font-bold">Transfer</p>
+                <select id="fromAccSelect" class="w-full p-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none" required></select>
+                <select id="toAccSelect" class="w-full p-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none" required></select>
+                <input type="number" step="0.01" id="transferAmt" placeholder="Amount" class="w-full p-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none" required>
+                <input type="text" id="transferDesc" value="Internal Transfer" class="w-full p-2.5 border border-slate-200 rounded-xl focus:ring-2 focus:ring-slate-900 outline-none">
+                <button type="submit" class="w-full bg-indigo-600 text-white font-bold py-3 rounded-xl hover:bg-indigo-700 transition">
+                    Confirm
+                </button>
+                <button type="button" onclick="toggleTransferModal()" class="w-full text-slate-400 text-xs mt-2 uppercase hover:text-slate-500 transition">
+                    CANCEL
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <script src="/static/script.js"></script>
+    <script src="/static/script_responsive.js"></script>
+</body>
+</html>
