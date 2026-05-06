@@ -76,15 +76,16 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 @app.get("/", response_class=HTMLResponse, tags=["Frontend"])
 async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    # TemplateResponse expects (request, name, context)
+    return templates.TemplateResponse(request, "index.html")
 
 @app.get("/login", response_class=HTMLResponse, tags=["Frontend"])
 async def login_page(request: Request):
-    return templates.TemplateResponse("login.html", {"request": request})
+    return templates.TemplateResponse(request, "login.html")
 
 @app.get("/register", response_class=HTMLResponse, tags=["Frontend"])
 async def register_page(request: Request):
-    return templates.TemplateResponse("register.html", {"request": request})
+    return templates.TemplateResponse(request, "register.html")
 
 # --- IAM API ---
 

@@ -36,7 +36,7 @@ class LedgerService:
             account.balance -= tx_in.amount
 
         # [3] AES-256 Encryption for sensitive financial fields
-        encrypted_amount = auth.encrypt_amount(tx_in.amount)
+        # encrypted_amount = auth.encrypt_amount(tx_in.amount)
         
         # Handle custom date parsing
         tx_date = datetime.now()
@@ -48,7 +48,7 @@ class LedgerService:
 
         new_tx = models.Transaction(
             description=tx_in.description,
-            amount=encrypted_amount,
+            amount=tx_in.amount,  # Store plaintext for response
             category=tx_in.category or "General",
             transaction_type=tx_in.transaction_type,
             account_id=tx_in.account_id,
@@ -157,15 +157,11 @@ class LedgerService:
         """
         processed = []
         for tx in query_results:
-            try:
-                decrypted_val = float(auth.decrypt_amount(tx.amount))
-            except Exception:
-                decrypted_val = 0.0
             
             processed.append(schemas.TransactionSchema(
                 id=tx.id,
                 description=tx.description,
-                amount=decrypted_val,
+                amount=tx.amount,
                 category=tx.category,
                 transaction_type=tx.transaction_type,
                 account_id=tx.account_id,
@@ -194,7 +190,7 @@ class LedgerService:
         account = db.query(models.Account).filter(models.Account.id == tx.account_id).with_for_update().first()
         if account:
             # Revert old amount
-            old_amount = float(auth.decrypt_amount(tx.amount))
+            old_amount = tx.amount
             if tx.transaction_type == "income":
                 account.balance -= old_amount
             else:
@@ -210,7 +206,6 @@ class LedgerService:
         tx.description = tx_in.description
         tx.category = tx_in.category
         tx.transaction_type = tx_in.transaction_type
-        tx.amount = auth.encrypt_amount(tx_in.amount)
         
         if tx_in.date:
             try:

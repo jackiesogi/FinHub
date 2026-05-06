@@ -56,7 +56,7 @@ class Transaction(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     description = Column(String)
-    amount = Column(String)  # Encrypted string
+    amount = Column(Float)  # Encrypted string
     category = Column(String)
     transaction_type = Column(String)
     date = Column(DateTime, default=func.now()) 
