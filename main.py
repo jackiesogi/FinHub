@@ -349,3 +349,56 @@ def reset_database_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database reset failed: {str(e)}"
         )
+
+
+# --- Catch-All Route for SPA Routing ---
+# Must be placed after all specific routes!
+
+@app.get("/{path_name:path}", response_class=HTMLResponse, tags=["Frontend"])
+async def catch_all(path_name: str, request: Request):
+    """
+    Catch-all route for Single Page Application (SPA) routing.
+
+    Allows the frontend to handle URL routing while serving the same HTML shell.
+    This enables URL persistence for pages like /dashboard, /assets, /audit
+    without full page reloads.
+
+    ✅ Benefits:
+    - URL reflects current page state
+    - Page refresh maintains current section
+    - Supports sharing URLs
+    - Browser back/forward buttons work
+    - No duplicate HTML files needed
+
+    Flow:
+    1. User accesses /dashboard → Returns index_responsive.html
+    2. Frontend's getPageFromURL() reads /dashboard
+    3. showSection('dashboard') is called
+    4. Dashboard page is displayed
+    """
+
+    # List of valid pages that should be served by SPA
+    valid_pages = {
+        "dashboard",      # Main financial dashboard
+        "assets",         # Portfolio/holdings overview
+        "audit",          # Security audit trail
+        "settings",       # (Future) User settings
+        "profile",        # (Future) User profile
+    }
+
+    # Extract the first path segment
+    # e.g., /dashboard/detail → dashboard
+    path_segments = path_name.strip("/").split("/") if path_name else []
+    page = path_segments[0] if path_segments and path_segments[0] else ""
+
+    # 🔍 Validation: Check if it's a valid SPA page
+    if page in valid_pages or not page:
+        # ✅ Valid page - serve the SPA shell
+        # The frontend will read the URL and display the correct section
+        return templates.TemplateResponse(request, "index_responsive.html")
+
+    # ❌ Invalid page - return 404
+    raise HTTPException(
+        status_code=404,
+        detail=f"Page '{page}' not found. Valid pages: {', '.join(valid_pages)}"
+    )

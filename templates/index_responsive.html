@@ -71,6 +71,10 @@
                    class="flex items-center space-x-3 px-3 md:px-4 py-2.5 bg-slate-100 rounded-lg font-semibold text-slate-950 hover:bg-slate-200 transition">
                     <span>📊</span><span>Dashboard</span>
                 </a>
+                <a href="#" onclick="showSection('assets')" id="nav-assets"
+                   class="flex items-center space-x-3 px-3 md:px-4 py-2.5 rounded-lg font-semibold text-slate-500 hover:bg-slate-50 transition">
+                    <span>💹</span><span>Assets</span>
+                </a>
                 <a href="#" onclick="showSection('audit')" id="nav-audit"
                    class="flex items-center space-x-3 px-3 md:px-4 py-2.5 rounded-lg font-semibold text-slate-500 hover:bg-slate-50 transition">
                     <span>🛡️</span><span>Security Logs</span>
@@ -196,6 +200,83 @@
                                     class="px-3 py-1 text-[10px] font-black bg-white border rounded-lg disabled:opacity-30 hover:bg-slate-50 transition">
                                 Next
                             </button>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Assets Section -->
+            <div id="section-assets" class="px-4 md:px-6 lg:px-8 py-6 md:py-8 space-y-6 md:space-y-8 hidden">
+
+                <!-- Assets Toolbar -->
+                <section class="bg-white px-4 md:px-6 py-4 rounded-2xl border border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                    <div>
+                        <h2 class="text-lg md:text-2xl font-bold text-slate-900">Portfolio Overview</h2>
+                        <p class="text-xs text-slate-500 mt-1">Connected to CJTrade • Last updated <span id="lastUpdateTime">Never</span></p>
+                    </div>
+                    <div class="flex gap-2 w-full sm:w-auto">
+                        <button id="refreshPortfolioBtn" onclick="refreshPortfolio()"
+                                class="px-4 md:px-6 py-2.5 text-sm font-bold text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 transition flex-1 sm:flex-none">
+                            🔄 Refresh
+                        </button>
+                        <button id="syncCJTradeBtn" onclick="syncWithCJTrade()"
+                                class="px-4 md:px-6 py-2.5 text-sm font-bold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition flex-1 sm:flex-none">
+                            ⚡ Sync CJTrade
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Portfolio Summary Cards -->
+                <section class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6">
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm">
+                        <p class="text-[10px] font-bold text-slate-400 uppercase mb-2">Total Value</p>
+                        <div class="text-2xl md:text-3xl font-black" id="portfolioTotalValue">$0</div>
+                        <p class="text-[10px] text-slate-400 mt-2">Market Value</p>
+                    </div>
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 border-l-4 border-l-emerald-500">
+                        <p class="text-[10px] font-bold text-emerald-500 uppercase mb-2">Total Cost</p>
+                        <div class="text-2xl md:text-3xl font-black text-emerald-600" id="portfolioTotalCost">$0</div>
+                        <p class="text-[10px] text-slate-400 mt-2">Entry Price Total</p>
+                    </div>
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 border-l-4 border-l-blue-500">
+                        <p class="text-[10px] font-bold text-blue-500 uppercase mb-2">Unrealized P&L</p>
+                        <div class="text-2xl md:text-3xl font-black text-blue-600" id="portfolioUnrealizedPnL">+$0</div>
+                        <p id="portfolioUnrealizedPnLPercent" class="text-[10px] text-slate-400 mt-2">+0%</p>
+                    </div>
+                    <div class="bg-white p-4 md:p-6 rounded-2xl border border-slate-200 border-l-4 border-l-purple-500">
+                        <p class="text-[10px] font-bold text-purple-500 uppercase mb-2">Holdings</p>
+                        <div class="text-2xl md:text-3xl font-black text-purple-600" id="portfolioHoldingCount">0</div>
+                        <p class="text-[10px] text-slate-400 mt-2">Active Positions</p>
+                    </div>
+                </section>
+
+                <!-- Holdings Table -->
+                <section class="bg-white border rounded-2xl overflow-x-auto shadow-sm">
+                    <table class="w-full text-left text-sm">
+                        <thead class="bg-slate-50 text-[10px] font-bold text-slate-400 uppercase border-b sticky top-0">
+                            <tr>
+                                <th class="px-4 md:px-8 py-4">Symbol</th>
+                                <th class="px-4 md:px-8 py-4 text-right">Quantity</th>
+                                <th class="hidden md:table-cell px-4 md:px-8 py-4 text-right">Avg Cost</th>
+                                <th class="px-4 md:px-8 py-4 text-right">Current Price</th>
+                                <th class="px-4 md:px-8 py-4 text-right">Value</th>
+                                <th class="px-4 md:px-8 py-4 text-right">uPnL</th>
+                                <th class="hidden sm:table-cell px-4 md:px-8 py-4 text-right">Return %</th>
+                            </tr>
+                        </thead>
+                        <tbody id="holdingsTable" class="divide-y">
+                            <!-- Holdings rows will be populated here -->
+                            <tr class="hover:bg-slate-50 transition">
+                                <td colspan="7" class="px-4 md:px-8 py-8 text-center text-slate-400 text-sm">
+                                    No holdings yet • <a href="#" onclick="syncWithCJTrade()" class="text-indigo-600 hover:underline">Sync to load</a>
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                    <div class="flex items-center justify-between px-4 md:px-8 py-4 bg-slate-50 border-t text-sm">
+                        <span class="text-[10px] font-bold text-slate-400 uppercase" id="holdingsCount">0 Holdings</span>
+                        <div class="flex gap-2">
+                            <button onclick="exportHoldings()" class="text-indigo-600 hover:underline text-xs font-bold">📥 Export</button>
                         </div>
                     </div>
                 </section>
