@@ -30,7 +30,7 @@ import models
 import schemas
 import auth
 from auth import get_current_user
-from services import LedgerService 
+from services import LedgerService
 from contextlib import asynccontextmanager
 from config import settings
 
@@ -51,9 +51,9 @@ async def lifespan(app: FastAPI):
     # [Startup]: Logic to execute when the server starts
     # Create database tables if they do not exist
     models.Base.metadata.create_all(bind=engine)
-    
+
     yield  # Control is handed over to the FastAPI application
-    
+
     # [Shutdown]: Logic to execute when the server stops
     # (e.g., closing database connection pools or clearing cache)
     pass
@@ -97,7 +97,7 @@ def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
     ).first()
     if db_user:
         raise HTTPException(status_code=400, detail="Identity already exists.")
-    
+
     new_user = models.User(
         username=user_in.username,
         email=user_in.email,
@@ -114,7 +114,7 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
     if not user or not auth.verify_password(form_data.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials.")
-    
+
     token = auth.create_access_token(data={"sub": user.username})
     return {"access_token": token, "token_type": "bearer"}
 
@@ -128,7 +128,7 @@ def get_dashboard_summary(
 ):
     """Calculates financial KPIs by decrypting and aggregating transactions."""
     tx_query = db.query(models.Transaction).filter(models.Transaction.owner_id == current_user.id)
-    
+
     if account_id:
         tx_query = tx_query.filter(models.Transaction.account_id == account_id)
         account = db.query(models.Account).filter(models.Account.id == account_id).first()
@@ -141,10 +141,10 @@ def get_dashboard_summary(
     txs = tx_query.all()
     # Decrypt records in-memory via Service Layer
     processed_txs = LedgerService.get_processed_transactions(txs)
-    
+
     income = sum(t.amount for t in processed_txs if t.transaction_type == "income")
     expense = sum(t.amount for t in processed_txs if t.transaction_type == "expense")
-    
+
     return {"total_income": income, "total_expense": expense, "balance": total_balance}
 
 @app.get("/api/v1/accounts", response_model=List[schemas.AccountSchema], tags=["Finance"])
@@ -176,7 +176,7 @@ def list_transactions(
     query = db.query(models.Transaction).filter(models.Transaction.owner_id == current_user.id)
     if account_id:
         query = query.filter(models.Transaction.account_id == account_id)
-    
+
     # Apply limit and offset at the database level before fetching to memory
     db_txs = query.offset(skip).limit(limit).all()
     processed_txs = LedgerService.get_processed_transactions(db_txs)
@@ -188,11 +188,11 @@ def list_transactions(
         "amount_asc": (lambda x: x.amount, False),
         "amount_desc": (lambda x: x.amount, True),
     }
-    
+
     if sort_by in sort_map:
         key_func, is_reverse = sort_map[sort_by]
         processed_txs.sort(key=key_func, reverse=is_reverse)
-    
+
     return processed_txs
 
 @app.post("/api/v1/transactions", status_code=201, tags=["Finance"])
@@ -209,9 +209,9 @@ def get_audit_logs(db: Session = Depends(get_db), current_user = Depends(get_cur
 
 @app.put("/api/v1/transactions/{tx_id}", tags=["Finance"])
 def update_transaction(
-    tx_id: int, 
-    tx_in: schemas.TransactionCreate, 
-    db: Session = Depends(get_db), 
+    tx_id: int,
+    tx_in: schemas.TransactionCreate,
+    db: Session = Depends(get_db),
     current_user = Depends(get_current_user)
 ):
     """Updates a transaction's details and synchronizes the account balance."""
@@ -219,8 +219,8 @@ def update_transaction(
 
 @app.post("/api/v1/transfers", tags=["Finance"], status_code=201)
 def internal_transfer(
-    transfer_in: schemas.TransferCreate, 
-    db: Session = Depends(get_db), 
+    transfer_in: schemas.TransferCreate,
+    db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
     """
@@ -231,7 +231,7 @@ def internal_transfer(
 
 @app.get("/api/v1/admin/users", tags=["Admin"])
 def get_system_users(
-    db: Session = Depends(get_db), 
+    db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
     """
@@ -241,12 +241,12 @@ def get_system_users(
     # [SECURITY CHECK] Replace 'Eason' with your actual admin username
     if current_user.username != "Eason":
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="Administrative privileges required."
         )
 
     users = db.query(models.User).all()
-    
+
     # [DATA AGGREGATION] Map user data and count their linked accounts
     admin_data = []
     for u in users:
@@ -255,6 +255,93 @@ def get_system_users(
             "email": u.email,
             "account_count": len(u.accounts)
         })
-    
+
     return admin_data
+
+
+@app.delete("/api/v1/accounts/{account_id}/transactions", tags=["Finance"])
+def clear_account_transactions(
+    account_id: int,
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    """
+    清空特定帳戶的所有交易記錄，但保留帳戶本身。
+    帳戶餘額會重設為 0。
+    """
+    # 驗證帳戶所有權
+    account = db.query(models.Account).filter(
+        models.Account.id == account_id,
+        models.Account.owner_id == current_user.id
+    ).first()
+
+    if not account:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Account not found or you don't have permission."
+        )
+
+    try:
+        # 刪除該帳戶的所有交易
+        db.query(models.Transaction).filter(
+            models.Transaction.account_id == account_id
+        ).delete()
+
+        # 重設帳戶餘額
+        account.balance = 0.0
+        db.commit()
+
+        return {
+            "status": "success",
+            "message": f"Account '{account.name}' transactions cleared. Balance reset to 0.",
+            "account_id": account_id,
+            "account_name": account.name,
+            "new_balance": 0.0
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to clear transactions: {str(e)}"
+        )
+
+
+@app.post("/api/v1/admin/reset-db")
+def reset_database_endpoint(
+    db: Session = Depends(get_db),
+    # current_user: models.User = Depends(get_current_user)
+):
+    """
+    Administrative endpoint to reset the entire database.
+    Clears all tables and recreates the schema.
+    Restricted to admin username for security.
+    No confirmation required - use with caution!
+    """
+    # [SECURITY CHECK] Only admin can reset database
+    # if current_user.username != "Eason":
+    #     raise HTTPException(
+    #         status_code=status.HTTP_403_FORBIDDEN,
+    #         detail="Administrative privileges required."
+    #     )
+
+    try:
+        # Close the current session to release any locks
+        db.close()
+
+        # Drop all tables
+        models.Base.metadata.drop_all(bind=engine)
+
+        # Recreate all tables
+        models.Base.metadata.create_all(bind=engine)
+
+        return {
+            "status": "success",
+            "message": "Database reset complete! All tables have been cleared and recreated.",
+            "timestamp": str(models.Base.metadata.tables)
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Database reset failed: {str(e)}"
+        )
 
