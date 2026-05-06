@@ -5,7 +5,7 @@
 
 document.getElementById('login-form').onsubmit = async (e) => {
     e.preventDefault();
-    
+
     const errorDiv = document.getElementById('error-msg');
     errorDiv.classList.add('hidden');
 
@@ -17,7 +17,7 @@ document.getElementById('login-form').onsubmit = async (e) => {
     try {
         const resp = await fetch('/api/v1/auth/login', {
             method: 'POST',
-            body: formData 
+            body: formData
         });
 
         const data = await resp.json();
@@ -26,7 +26,7 @@ document.getElementById('login-form').onsubmit = async (e) => {
             // Store token for global authenticated requests
             localStorage.setItem('token', data.access_token);
             // Redirect to main ledger dashboard
-            window.location.href = '/'; 
+            window.location.href = '/';
         } else {
             // Display authentication failure (e.g., Invalid credentials)
             errorDiv.innerText = data.detail || "Authentication failed. Please check your credentials.";

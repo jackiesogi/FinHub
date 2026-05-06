@@ -5,13 +5,13 @@
 
 document.getElementById('register-form').onsubmit = async (e) => {
     e.preventDefault();
-    
+
     const errorDiv = document.getElementById('error-msg');
     const submitBtn = document.getElementById('submit-btn');
-    
+
     // Reset state
     errorDiv.classList.add('hidden');
-    
+
     const payload = {
         username: document.getElementById('username').value,
         email: document.getElementById('email').value,
@@ -33,7 +33,7 @@ document.getElementById('register-form').onsubmit = async (e) => {
             submitBtn.classList.replace('bg-slate-900', 'bg-emerald-500');
 
             setTimeout(() => {
-                window.location.href = '/login'; 
+                window.location.href = '/login';
             }, 1000);
         } else {
             // Display API-specific error details (e.g., User already exists)

@@ -49,8 +49,8 @@ class AccountSchema(AccountBase):
 class TransactionBase(BaseModel):
     """Base definition for a ledger entry."""
     description: str
-    amount: float          
-    category: str          
+    amount: float
+    category: str
     transaction_type: str  # 'income' or 'expense'
     account_id: int        # [REQUIRED] Links the transaction to a specific account
     date: Optional[str] = None # Stores the custom date from the frontend

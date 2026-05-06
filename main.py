@@ -344,4 +344,3 @@ def reset_database_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Database reset failed: {str(e)}"
         )
-

@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     """
     # [1] Database URL with an automatic fix for Render (postgres -> postgresql)
     DATABASE_URL: str = ""
-    
+
     # [2] Secret Key for JWT authentication
     SECRET_KEY: str = "temporary_default_key"
 

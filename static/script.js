@@ -19,7 +19,7 @@ let totalVisibleTxs = []; // CRITICAL: Cache for index-based editing/deleting
 function checkAuth() {
     const path = window.location.pathname;
     if (!token && !path.includes('login') && !path.includes('register')) {
-        window.location.href = '/login'; 
+        window.location.href = '/login';
         return false;
     }
     return true;
@@ -59,23 +59,23 @@ async function applyFilter() {
     try {
         const res = await fetch(url, { headers: { 'Authorization': `Bearer ${token}` } });
         if (!res.ok) throw new Error(`Fetch failed with status: ${res.status}`);
-        
+
         const data = await res.json();
         const txList = Array.isArray(data) ? data : (data.items || []);
-        totalVisibleTxs = txList; 
+        totalVisibleTxs = txList;
 
         renderTable(txList);
-        updatePaginationUI(data); 
+        updatePaginationUI(data);
 
         const dashUrl = `/api/v1/dashboard${accId !== 'all' ? `?account_id=${accId}` : ''}`;
         const dashRes = await fetch(dashUrl, { headers: { 'Authorization': `Bearer ${token}` } });
         const summary = await dashRes.json();
-        
+
         updateKPIs(summary);
         renderBar(summary.total_income || 0, summary.total_expense || 0);
         renderCategoryChart(generateCategoryData(txList));
-    } catch (err) { 
-        console.error("Sync Error:", err); 
+    } catch (err) {
+        console.error("Sync Error:", err);
     }
 }
 
@@ -87,12 +87,12 @@ async function refreshDataSync(targetId) {
     try {
         const acctRes = await fetch('/api/v1/accounts', { headers: { 'Authorization': `Bearer ${token}` } });
         allAccounts = await acctRes.json();
-        
+
         // Update UI but force the previous active ID to stay selected
         updateAccountUI(allAccounts, targetId);
-        
+
         // Execute the filter to refresh the table for that specific ID
-        await applyFilter(); 
+        await applyFilter();
     } catch (err) { console.error("Refresh Error:", err); }
 }
 
@@ -126,8 +126,8 @@ function renderTable(txs) {
                 <td class="px-8 py-4"><span class="px-2 py-0.5 rounded-md text-[10px] font-bold bg-slate-100 text-slate-500 uppercase">${tx.category}</span></td>
                 <td class="px-8 py-4 text-right font-mono font-bold ${amtClass}">${tx.transaction_type==='income'?'+':'-'}$${tx.amount.toLocaleString()}</td>
                 <td class="px-8 py-4 text-right space-x-3">
-                    ${isTransfer ? 
-                        `<span class="text-[10px] font-bold text-slate-300 italic">Locked</span>` : 
+                    ${isTransfer ?
+                        `<span class="text-[10px] font-bold text-slate-300 italic">Locked</span>` :
                         `<button onclick="handleEditClick(${idx})" class="text-[10px] font-black text-indigo-600 hover:text-indigo-900 uppercase transition-all">Edit</button>`
                     }
                     <button onclick="deleteTx(${tx.id})" class="text-[10px] font-black text-rose-400 hover:text-rose-600 uppercase transition-all">Delete</button>
@@ -156,9 +156,9 @@ function changePage(step) {
     applyFilter();
 }
 
-function toggleSort(f) { 
-    currentSort = (currentSort === f + '_desc') ? f + '_asc' : f + '_desc'; 
-    applyFilter(); 
+function toggleSort(f) {
+    currentSort = (currentSort === f + '_desc') ? f + '_asc' : f + '_desc';
+    applyFilter();
 }
 
 // --- [6] DATA VISUALIZATION ---
@@ -199,44 +199,44 @@ function handleEditClick(index) {
 
 /**
  * TRANSACTION SUBMISSION
- * Corrected: Now captures the active account filter before saving, 
+ * Corrected: Now captures the active account filter before saving,
  * ensuring the user stays on the same account view after the refresh.
  */
 document.getElementById('transactionForm').onsubmit = async (e) => {
     e.preventDefault();
     const currentActive = document.getElementById('headerAccountFilter').value;
-    
+
     const amtValue = parseFloat(document.getElementById('amt').value);
     if (isNaN(amtValue) || amtValue <= 0) {
         alert("請輸入大於 0 的合法金額！"); // 擋住負數與 0
         document.getElementById('amt').focus();
-        return; 
+        return;
     }
 
-    const payload = { 
-        account_id: parseInt(document.getElementById('accountSelect').value), 
-        description: document.getElementById('desc').value, 
-        amount: parseFloat(document.getElementById('amt').value), 
-        category: document.getElementById('cat').value || "General", 
-        transaction_type: document.getElementById('type').value, 
-        date: document.getElementById('txDate').value 
+    const payload = {
+        account_id: parseInt(document.getElementById('accountSelect').value),
+        description: document.getElementById('desc').value,
+        amount: parseFloat(document.getElementById('amt').value),
+        category: document.getElementById('cat').value || "General",
+        transaction_type: document.getElementById('type').value,
+        date: document.getElementById('txDate').value
     };
 
     const method = editingTxId ? 'PUT' : 'POST';
     const url = editingTxId ? `/api/v1/transactions/${editingTxId}` : '/api/v1/transactions';
-    
-    const res = await fetch(url, { 
-        method, 
-        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, 
-        body: JSON.stringify(payload) 
+
+    const res = await fetch(url, {
+        method,
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
     });
 
-    if (res.ok) { 
-        toggleModal(); 
-        editingTxId = null; 
+    if (res.ok) {
+        toggleModal();
+        editingTxId = null;
         document.getElementById('transactionForm').reset();
         // Sycn state without jumping back to 'all'
-        await refreshDataSync(currentActive); 
+        await refreshDataSync(currentActive);
     }
 };
 
@@ -260,13 +260,13 @@ document.getElementById('transferForm').onsubmit = async (e) => {
 
     try {
         const res = await fetch('/api/v1/transfers', { method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
-        if (res.ok) { 
-            toggleTransferModal(); 
-            document.getElementById('transferForm').reset(); 
-            await refreshDataSync(currentActive); 
-        } else { 
-            const errData = await res.json(); 
-            alert(`Transfer Failed: ${errData.detail || "Error"}`); 
+        if (res.ok) {
+            toggleTransferModal();
+            document.getElementById('transferForm').reset();
+            await refreshDataSync(currentActive);
+        } else {
+            const errData = await res.json();
+            alert(`Transfer Failed: ${errData.detail || "Error"}`);
         }
     } catch (err) { console.error("Transfer Error:", err); }
 };
@@ -313,31 +313,31 @@ function selectAccountFromSidebar(id) {
 function updateAccountUI(accounts, activeId = 'all') {
     const sidebar = document.getElementById('accountBalances');
     const filterSelect = document.getElementById('headerAccountFilter');
-    
+
     // Maintain the active filter logic
     const currentActive = activeId || filterSelect.value;
 
     sidebar.innerHTML = accounts.map(a => {
         const isActive = String(currentActive) === String(a.id);
         const bgClass = isActive ? 'bg-slate-200 ring-1 ring-slate-300' : 'hover:bg-white';
-        
+
         return `
-            <div onclick="selectAccountFromSidebar('${a.id}')" 
+            <div onclick="selectAccountFromSidebar('${a.id}')"
                  class="group flex justify-between items-center p-2.5 rounded-xl transition-all cursor-pointer ${bgClass}">
                 <div class="flex flex-col">
                     <span class="text-slate-900 font-bold text-xs truncate w-24">${a.name}</span>
                     <span class="text-[11px] font-black text-slate-500">$${a.balance.toLocaleString()}</span>
                 </div>
-                
-                <button onclick="event.stopPropagation(); deleteAccount(${a.id})" 
+
+                <button onclick="event.stopPropagation(); deleteAccount(${a.id})"
                         class="opacity-0 group-hover:opacity-100 px-2 py-1 text-[10px] font-black text-rose-400 hover:text-rose-600 uppercase transition-all">
                     Delete
                 </button>
             </div>`;
     }).join('');
-    
+
     filterSelect.innerHTML = '<option value="all">ALL ACCOUNTS</option>' + accounts.map(a => `<option value="${a.id}">${a.name.toUpperCase()}</option>`).join('');
-    filterSelect.value = currentActive; 
+    filterSelect.value = currentActive;
 
     document.getElementById('accountSelect').innerHTML = accounts.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
 }
@@ -348,19 +348,19 @@ async function initDashboard() {
         const acctRes = await fetch('/api/v1/accounts', { headers: { 'Authorization': `Bearer ${token}` } });
         if (acctRes.status === 401) { logout(); return; }
         allAccounts = await acctRes.json();
-        updateAccountUI(allAccounts, 'all'); 
+        updateAccountUI(allAccounts, 'all');
         applyFilter();
         document.getElementById('currentUserDisplay').innerText = `Active Session`;
 
-        
-        await fetchAdminStats(); 
+
+        await fetchAdminStats();
 
     } catch (err) { console.error("Init Error", err); }
 }
 
-function toggleModal() { 
-    document.getElementById('modal').classList.toggle('opacity-0'); 
-    document.getElementById('modal').classList.toggle('pointer-events-none'); 
+function toggleModal() {
+    document.getElementById('modal').classList.toggle('opacity-0');
+    document.getElementById('modal').classList.toggle('pointer-events-none');
     // Reset modal title if closing
     if (document.getElementById('modal').classList.contains('opacity-0')) {
         document.getElementById('modalTitle').innerText = "New Ledger Entry";
@@ -370,7 +370,7 @@ function toggleModal() {
     }
 }
 function toggleAccountModal() { document.getElementById('accountModal').classList.toggle('opacity-0'); document.getElementById('accountModal').classList.toggle('pointer-events-none'); }
-function toggleTransferModal() { 
+function toggleTransferModal() {
     const m = document.getElementById('transferModal');
     m.classList.toggle('opacity-0'); m.classList.toggle('pointer-events-none');
     if (!m.classList.contains('opacity-0')) {
@@ -386,12 +386,12 @@ window.onload = initDashboard;
 
 async function deleteAccount(id) {
     if (confirm("刪除帳號會連同該帳號的交易紀錄一併刪除，確定嗎？")) {
-        const res = await fetch(`/api/v1/accounts/${id}`, { 
-            method: 'DELETE', 
-            headers: { 'Authorization': `Bearer ${token}` } 
+        const res = await fetch(`/api/v1/accounts/${id}`, {
+            method: 'DELETE',
+            headers: { 'Authorization': `Bearer ${token}` }
         });
         if (res.ok) {
-            initDashboard(); 
+            initDashboard();
         } else {
             const err = await res.json();
             alert(`刪除失敗: ${err.detail}`);
@@ -413,7 +413,7 @@ async function fetchAdminStats() {
             const users = await res.json();
             console.log("--- ADMIN SYSTEM REPORT ---");
             console.table(users); // Displays a neat table in your Browser Console (F12)
-            
+
             // Optional: You can render this to a specific DIV in your HTML later
         } else {
             console.log("Access to Admin API restricted.");

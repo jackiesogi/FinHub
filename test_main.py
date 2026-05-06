@@ -71,7 +71,7 @@ def test_scenario_1_standard_transfer():
 
     a1 = client.post("/api/v1/accounts", headers=auth, json={"name": "Vault_A", "balance": 1000.0}).json()
     a2 = client.post("/api/v1/accounts", headers=auth, json={"name": "Vault_B", "balance": 50.0}).json()
-    
+
     client.post("/api/v1/transfers", headers=auth, json={
         "from_account_id": a1['id'], "to_account_id": a2['id'], "amount": 200.0
     })
@@ -96,11 +96,11 @@ def test_scenario_2_overdraft_prevention():
 
     log.info(f"   💸 Attempting illegal transfer: $99,999 from {acc_src['name']}")
     res = client.post("/api/v1/transfers", headers=auth, json={
-        "from_account_id": acc_src['id'], 
-        "to_account_id": acc_dst['id'], 
+        "from_account_id": acc_src['id'],
+        "to_account_id": acc_dst['id'],
         "amount": 99999.0
     })
-    
+
     assert res.status_code == 400
 
     # PROOF: Direct SQL check
@@ -116,7 +116,7 @@ def test_scenario_3_negative_amount():
     log.info(f"[SCENARIO 3] Negative Amount Check for {user}")
 
     acc = client.post("/api/v1/accounts", headers=auth, json={"name": "FixedVault", "balance": 500.0}).json()
-    
+
     res = client.post("/api/v1/transfers", headers=auth, json={
         "from_account_id": acc['id'], "to_account_id": 1, "amount": -100.0
     })

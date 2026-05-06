@@ -1,20 +1,20 @@
 /* --- UI/UX FOUNDATION --- */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
 
-body { 
-    font-family: 'Inter', sans-serif; 
+body {
+    font-family: 'Inter', sans-serif;
     -webkit-font-smoothing: antialiased;
 }
 
 /* --- ANIMATIONS & MODALS --- */
-.modal { 
-    transition: opacity 0.25s ease, visibility 0.25s ease; 
+.modal {
+    transition: opacity 0.25s ease, visibility 0.25s ease;
 }
 
 /* Minimalist Scrollbar */
-::-webkit-scrollbar { 
-    width: 0px; 
-    background: transparent; 
+::-webkit-scrollbar {
+    width: 0px;
+    background: transparent;
 }
 
 .hidden {

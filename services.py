@@ -37,7 +37,7 @@ class LedgerService:
 
         # [3] AES-256 Encryption for sensitive financial fields
         # encrypted_amount = auth.encrypt_amount(tx_in.amount)
-        
+
         # Handle custom date parsing
         tx_date = datetime.now()
         if tx_in.date:
@@ -58,7 +58,7 @@ class LedgerService:
 
         try:
             db.add(new_tx)
-            db.flush() 
+            db.flush()
 
             # [4] Security Audit Logging for compliance
             log = models.AuditLog(
@@ -70,7 +70,7 @@ class LedgerService:
             db.add(log)
             db.commit()
             db.refresh(new_tx)
-            
+
             # Decrypt amount for the final response without affecting DB state
             new_tx.amount = tx_in.amount
             return new_tx
@@ -131,9 +131,9 @@ class LedgerService:
 
         try:
             log = models.AuditLog(
-                user_id=user_id, 
-                action="DELETE_ACCOUNT", 
-                target_id=account_id, 
+                user_id=user_id,
+                action="DELETE_ACCOUNT",
+                target_id=account_id,
                 details=f"Deleted account: {account.name}"
             )
             db.add(log)
@@ -157,7 +157,7 @@ class LedgerService:
         """
         processed = []
         for tx in query_results:
-            
+
             processed.append(schemas.TransactionSchema(
                 id=tx.id,
                 description=tx.description,
@@ -195,7 +195,7 @@ class LedgerService:
                 account.balance -= old_amount
             else:
                 account.balance += old_amount
-            
+
             # Apply new amount
             if tx_in.transaction_type == "income":
                 account.balance += tx_in.amount
@@ -206,7 +206,7 @@ class LedgerService:
         tx.description = tx_in.description
         tx.category = tx_in.category
         tx.transaction_type = tx_in.transaction_type
-        
+
         if tx_in.date:
             try:
                 tx.date = datetime.strptime(tx_in.date, "%Y-%m-%d")
@@ -224,7 +224,7 @@ class LedgerService:
             db.add(log)
             db.commit()
             db.refresh(tx)
-            
+
             tx.amount = tx_in.amount # Decrypt for response
             return tx
         except Exception:
@@ -241,13 +241,13 @@ class LedgerService:
         """
         if transfer_in.from_account_id == transfer_in.to_account_id:
             raise HTTPException(status_code=400, detail="Source and destination accounts must be different.")
-        
+
         if transfer_in.amount <= 0:
             raise HTTPException(status_code=400, detail="Transfer amount must be positive.")
 
         # [1] DEADLOCK PREVENTION: Always lock the account with the smaller ID first
         account_ids = sorted([transfer_in.from_account_id, transfer_in.to_account_id])
-        
+
         try:
             # [2] LOCK ACCOUNTS
             accounts_map = {}
@@ -311,7 +311,7 @@ class LedgerService:
             )
             db.add(log)
             db.commit()
-            
+
             return {"status": "success", "amount": transfer_in.amount}
 
         except HTTPException:

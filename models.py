@@ -42,8 +42,8 @@ class Account(Base):
     # 'cascade="all, delete-orphan"' ensures that when an Account is deleted,
     # all its child Transaction objects are also purged from the database.
     transactions = relationship(
-        "Transaction", 
-        back_populates="account", 
+        "Transaction",
+        back_populates="account",
         cascade="all, delete-orphan"
     )
 
@@ -59,14 +59,14 @@ class Transaction(Base):
     amount = Column(Float)  # Encrypted string
     category = Column(String)
     transaction_type = Column(String)
-    date = Column(DateTime, default=func.now()) 
+    date = Column(DateTime, default=func.now())
     account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"))
     owner_id = Column(Integer, ForeignKey("users.id"))
-    
-    # [DATABASE LEVEL CASCADE] 
+
+    # [DATABASE LEVEL CASCADE]
     # 'ondelete="CASCADE"' ensures referential integrity at the SQL engine level.
     account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"))
-    
+
     # Relationships
     account = relationship("Account", back_populates="transactions")
     owner = relationship("User", back_populates="transactions")
