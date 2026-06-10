@@ -125,10 +125,16 @@
                         <h2 id="pageTitle" class="text-lg md:text-2xl font-bold text-slate-900">Financial Dashboard</h2>
                         <p class="text-xs text-slate-500 mt-1">Manage your accounts and transactions</p>
                     </div>
-                    <button id="addEntryBtn" onclick="toggleModal()"
-                            class="px-4 md:px-6 py-2.5 text-sm font-bold text-white bg-slate-900 rounded-lg shadow-md hover:bg-slate-800 transition w-full sm:w-auto">
-                        ✨ Add Entry
-                    </button>
+                    <div class="flex flex-col sm:flex-row gap-2 w-full sm:w-auto">
+                        <button id="addEntryBtn" onclick="toggleModal()"
+                                class="px-4 md:px-6 py-2.5 text-sm font-bold text-white bg-slate-900 rounded-lg shadow-md hover:bg-slate-800 transition w-full sm:w-auto">
+                            ✨ Add Entry
+                        </button>
+                        <button onclick="resetAndSyncCJTrade()"
+                                class="px-4 md:px-6 py-2.5 text-sm font-bold text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-lg shadow-sm hover:bg-indigo-100 transition w-full sm:w-auto">
+                            ↺ Reset & Sync CJTrade
+                        </button>
+                    </div>
                 </section>
 
                 <!-- KPI Cards -->
@@ -394,5 +400,6 @@
 
     <script src="/static/script.js"></script>
     <script src="/static/script_responsive.js"></script>
+    <script src="/static/cjtrade_extension.js"></script>
 </body>
 </html>

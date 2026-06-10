@@ -311,6 +311,137 @@ def clear_account_transactions(
         )
 
 
+@app.post("/api/v1/cjtrade/sync/{account_id}", tags=["CJTrade"])
+def cjtrade_sync_account(
+    account_id: int,
+    cjtrade_url: str = "http://localhost:8899",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Reset an account's transactions and re-import from CJTrade.
+
+    Steps:
+    1. Verify account ownership.
+    2. Clear all existing transactions + reset balance to 0.
+    3. Fetch ``initial_equity`` and ``trades`` from CJTrade.
+    4. Bulk-insert: one INITIAL income entry + one entry per trade (BUY=expense, SELL=income).
+    5. Write an audit log entry.
+    """
+    import json as _json
+    import urllib.request as _urllib_req
+
+    # ── 1. ownership check ────────────────────────────────────────────────────
+    account = db.query(models.Account).filter(
+        models.Account.id == account_id,
+        models.Account.owner_id == current_user.id,
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found.")
+
+    # ── 2. fetch from CJTrade ─────────────────────────────────────────────────
+    def _get(path: str):
+        req = _urllib_req.Request(
+            f"{cjtrade_url}{path}",
+            headers={"Authorization": "Bearer cjtrade-finhub-backend"},
+        )
+        with _urllib_req.urlopen(req, timeout=5) as resp:  # noqa: S310
+            return _json.loads(resp.read())
+
+    try:
+        acct_data   = _get("/api/v1/account")
+        trades_data = _get("/api/v1/trades")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"CJTrade unreachable: {exc}")
+
+    # ── 3. clear existing transactions ────────────────────────────────────────
+    db.query(models.Transaction).filter(
+        models.Transaction.account_id == account_id,
+    ).delete(synchronize_session=False)
+    account.balance = 0.0
+
+    # ── 4. build entry list ───────────────────────────────────────────────────
+    from datetime import datetime as _dt
+
+    cash_balance = acct_data.get("balance", 0.0)
+    launch_mode  = acct_data.get("launch_mode", "unknown")
+    session_id   = acct_data.get("session_id", "")
+
+    entries = [{
+        "description":       f"CJTrade 初始現金 [{launch_mode}]",
+        "amount":            cash_balance,
+        "category":          "Trading",
+        "transaction_type":  "income",
+        "date":              _dt.now(),
+    }]
+
+    # trades arrive newest-first; reverse so balance progresses chronologically
+    for trade in reversed(trades_data):
+        action = trade.get("action", "")
+        symbol = trade.get("symbol", "")
+        qty    = trade.get("quantity", 0)
+        price  = trade.get("price", 0.0)
+        amount = round(price * qty, 2)
+        try:
+            ts = _dt.fromisoformat(trade.get("timestamp", ""))
+        except Exception:
+            ts = _dt.now()
+
+        if action == "BUY":
+            tx_type = "expense"
+            desc    = f"買入 {symbol} ×{qty} @{price}"
+        else:
+            tx_type = "income"
+            desc    = f"賣出 {symbol} ×{qty} @{price}"
+
+        entries.append({
+            "description":      desc,
+            "amount":           amount,
+            "category":         "Trading",
+            "transaction_type": tx_type,
+            "date":             ts,
+        })
+
+    # ── 5. bulk insert ────────────────────────────────────────────────────────
+    for e in entries:
+        db.add(models.Transaction(
+            description=e["description"],
+            amount=e["amount"],
+            category=e["category"],
+            transaction_type=e["transaction_type"],
+            account_id=account_id,
+            owner_id=current_user.id,
+            date=e["date"],
+        ))
+        if e["transaction_type"] == "income":
+            account.balance += e["amount"]
+        else:
+            account.balance -= e["amount"]
+
+    db.add(models.AuditLog(
+        user_id=current_user.id,
+        action="CJTRADE_SYNC",
+        target_id=account_id,
+        details=(
+            f"Reset & imported {len(entries)} entries from CJTrade "
+            f"[{launch_mode}] session={session_id}"
+        ),
+    ))
+
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "status":       "success",
+        "imported":     len(entries),
+        "launch_mode":  launch_mode,
+        "session_id":   session_id,
+        "new_balance":  round(account.balance, 2),
+    }
+
+
 @app.post("/api/v1/admin/reset-db")
 def reset_database_endpoint(
     db: Session = Depends(get_db),
