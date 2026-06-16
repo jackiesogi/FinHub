@@ -311,6 +311,117 @@ def clear_account_transactions(
         )
 
 
+@app.post("/api/v1/cjtrade/sync-incremental/{account_id}", tags=["CJTrade"])
+def cjtrade_sync_incremental(
+    account_id: int,
+    since: Optional[str] = None,
+    cjtrade_url: str = "http://localhost:8899",
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Append only trades newer than *since* (ISO timestamp) from CJTrade.
+
+    Does NOT clear existing transactions.  Designed for periodic polling.
+    Returns the number of new entries written and the latest trade timestamp
+    seen (to be stored client-side for the next call).
+    """
+    import json as _json
+    import urllib.request as _urllib_req
+    from datetime import datetime as _dt
+
+    account = db.query(models.Account).filter(
+        models.Account.id == account_id,
+        models.Account.owner_id == current_user.id,
+    ).first()
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found.")
+
+    def _get(path: str):
+        req = _urllib_req.Request(
+            f"{cjtrade_url}{path}",
+            headers={"Authorization": "Bearer cjtrade-finhub-backend"},
+        )
+        with _urllib_req.urlopen(req, timeout=5) as resp:  # noqa: S310
+            return _json.loads(resp.read())
+
+    try:
+        trades_data = _get("/api/v1/trades")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"CJTrade unreachable: {exc}")
+
+    # Parse the since cutoff
+    since_dt = None
+    if since:
+        try:
+            since_dt = _dt.fromisoformat(since)
+        except ValueError:
+            raise HTTPException(status_code=422, detail=f"Invalid since timestamp: {since}")
+
+    # trades arrive newest-first; reverse to process oldest→newest
+    new_entries = []
+    latest_ts = since
+
+    for trade in reversed(trades_data):
+        # Skip orders that were not filled
+        if trade.get('order_status', '').upper() != 'FILLED':
+            continue
+        try:
+            ts = _dt.fromisoformat(trade.get("timestamp", ""))
+        except Exception:
+            continue
+
+        if since_dt and ts <= since_dt:
+            continue  # already imported
+
+        action = trade.get("action", "")
+        symbol = trade.get("symbol", "")
+        qty    = trade.get("quantity", 0)
+        price  = trade.get("price", 0.0)
+        amount = round(price * qty, 2)
+
+        if action == "BUY":
+            tx_type = "expense"
+            desc    = f"買入 {symbol} ×{qty} @{price}"
+        else:
+            tx_type = "income"
+            desc    = f"賣出 {symbol} ×{qty} @{price}"
+
+        db.add(models.Transaction(
+            description=desc,
+            amount=amount,
+            category="Trading",
+            transaction_type=tx_type,
+            account_id=account_id,
+            owner_id=current_user.id,
+            date=ts,
+        ))
+        if tx_type == "income":
+            account.balance += amount
+        else:
+            account.balance -= amount
+
+        latest_ts = ts.isoformat()
+        new_entries.append(desc)
+
+    if new_entries:
+        db.add(models.AuditLog(
+            user_id=current_user.id,
+            action="CJTRADE_INCREMENTAL_SYNC",
+            target_id=account_id,
+            details=f"Appended {len(new_entries)} new trades since {since}",
+        ))
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+
+    return {
+        "imported":       len(new_entries),
+        "latest_timestamp": latest_ts,
+    }
+
+
 @app.post("/api/v1/cjtrade/sync/{account_id}", tags=["CJTrade"])
 def cjtrade_sync_account(
     account_id: int,
@@ -376,6 +487,9 @@ def cjtrade_sync_account(
 
     # trades arrive newest-first; reverse so balance progresses chronologically
     for trade in reversed(trades_data):
+        # Skip orders that were not filled
+        if trade.get('order_status', '').upper() != 'FILLED':
+            continue
         action = trade.get("action", "")
         symbol = trade.get("symbol", "")
         qty    = trade.get("quantity", 0)

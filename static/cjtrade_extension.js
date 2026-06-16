@@ -16,8 +16,10 @@
  */
 
 const CJTRADE_BASE_URL = 'http://localhost:8899';
-const CJTRADE_TOKEN_KEY = 'cjtrade_token';
-const CJTRADE_POLL_INTERVAL_MS = 60_000;   // 1 minute
+const CJTRADE_TOKEN_KEY = 'cjtrade_token';       // sessionStorage — cleared on tab close
+const CJTRADE_POLL_INTERVAL_MS = 60_000;          // 1 minute
+const CJTRADE_LAST_TS_KEY   = 'cjtrade_last_trade_ts';     // localStorage — persists across refresh
+const CJTRADE_ACCOUNT_KEY   = 'cjtrade_sync_account_id';   // localStorage — persists across refresh
 
 let _cjtradePollingTimer = null;
 
@@ -144,6 +146,47 @@ async function _cjtradePartialRefresh() {
         fetchCJTradePositions(),
         fetchCJTradeAccount(),
     ]);
+    await syncCJTradeIncremental();
+    // Always refresh the FinHub dashboard table from DB (picks up any newly written trades)
+    const accountId = localStorage.getItem(CJTRADE_ACCOUNT_KEY);
+    if (accountId && typeof refreshDataSync === 'function') {
+        await refreshDataSync(parseInt(accountId));
+    }
+}
+
+/**
+ * Append only trades newer than the last known timestamp.
+ * Silently skips if no account has been synced yet (no CJTRADE_ACCOUNT_KEY).
+ */
+async function syncCJTradeIncremental() {
+    const accountId = localStorage.getItem(CJTRADE_ACCOUNT_KEY);
+    if (!accountId) return;  // never done a full reset yet
+
+    const since    = localStorage.getItem(CJTRADE_LAST_TS_KEY) || '';
+    const fhToken  = localStorage.getItem('token');
+    if (!fhToken) return;
+
+    try {
+        const params = new URLSearchParams({
+            cjtrade_url: CJTRADE_BASE_URL,
+            ...(since ? { since } : {}),
+        });
+        const res = await fetch(
+            `/api/v1/cjtrade/sync-incremental/${accountId}?${params}`,
+            { method: 'POST', headers: { 'Authorization': `Bearer ${fhToken}` } }
+        );
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || res.statusText);
+
+        if (data.imported > 0) {
+            console.log(`[CJTrade] Incremental sync: +${data.imported} trades`);
+            if (data.latest_timestamp)
+                localStorage.setItem(CJTRADE_LAST_TS_KEY, data.latest_timestamp);
+            // Note: dashboard refresh is handled by _cjtradePartialRefresh after this call
+        }
+    } catch (err) {
+        console.warn('[CJTrade] syncCJTradeIncremental error:', err.message);
+    }
 }
 
 // ── Override stubs from script_responsive.js ─────────────────────────────────
@@ -215,6 +258,20 @@ async function resetAndSyncCJTrade() {
         if (typeof refreshDataSync === 'function') {
             await refreshDataSync(parseInt(accountId));
         }
+
+        // Remember which account and the latest timestamp for incremental polling.
+        // Always clear the stale anchor first — a leftover timestamp from a previous
+        // backtest session would cause new trades (with earlier mock times) to be skipped.
+        localStorage.setItem(CJTRADE_ACCOUNT_KEY, accountId);
+        localStorage.removeItem(CJTRADE_LAST_TS_KEY);
+        try {
+            const trades = await _cjtradeGet('/api/v1/trades');
+            if (trades && trades.length > 0) {
+                // trades are newest-first; anchor to the latest mock timestamp
+                localStorage.setItem(CJTRADE_LAST_TS_KEY, trades[0].timestamp);
+            }
+            // If no trades yet, key stays absent → next incremental poll imports everything
+        } catch (_) {}
     } catch (err) {
         alert(`Sync failed: ${err.message}`);
         console.error('[CJTrade] resetAndSyncCJTrade error:', err);
