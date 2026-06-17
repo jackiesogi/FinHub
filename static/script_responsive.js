@@ -316,7 +316,7 @@ function updateHoldingsUI(holdings) {
 
     table.innerHTML = rows;
     holdingsCount.textContent = `${holdings.length} Holdings`;
-    updatePortfolioSummary({ totalValue, totalCost, totalUnrealizedPnL });
+    updatePortfolioSummary({ totalValue, totalCost, totalUnrealizedPnL, holdings });
 }
 
 /**
@@ -335,12 +335,14 @@ function updatePortfolioSummary(summary) {
     const pnlColor = summary.totalUnrealizedPnL >= 0 ? 'emerald' : 'red';
     const pnlSign = summary.totalUnrealizedPnL >= 0 ? '+' : '';
     const returnPercent = ((summary.totalUnrealizedPnL / summary.totalCost) * 100).toFixed(2);
+    const holdingsCount = summary.holdings.length
 
     document.getElementById('portfolioTotalValue').textContent = `$${summary.totalValue.toFixed(2)}`;
     document.getElementById('portfolioTotalCost').textContent = `$${summary.totalCost.toFixed(2)}`;
     document.getElementById('portfolioUnrealizedPnL').textContent = `${pnlSign}$${summary.totalUnrealizedPnL.toFixed(2)}`;
     document.getElementById('portfolioUnrealizedPnL').className = `text-2xl md:text-3xl font-black text-${pnlColor}-600`;
     document.getElementById('portfolioUnrealizedPnLPercent').textContent = `${pnlSign}${returnPercent}%`;
+    document.getElementById('portfolioHoldingCount').textContent = `${holdingsCount}`;
 }
 
 /**
