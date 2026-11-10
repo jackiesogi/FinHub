@@ -449,7 +449,11 @@
                     </div>
                     <div>
                         <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Speed</label>
-                        <input type="number" id="runSpeed" value="1" step="0.1" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none">
+                        <input type="number" id="runSpeed" value="0" min="0" step="1" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none">
+                        <!-- Market seconds per real second. 0 keeps the old
+                             behaviour of a backtest, which ignored this field
+                             entirely and always ran flat out. -->
+                        <p class="text-[11px] text-slate-400 mt-2">Market seconds per real second. <b>0 = as fast as possible.</b> 1 replays at the speed the market moved, so a 20-day run takes about 66 hours. Ignored in paper mode.</p>
                     </div>
                 </div>
                 <div>

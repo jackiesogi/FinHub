@@ -257,7 +257,7 @@ def test_run_config_refuses_anything_that_is_not_a_symbol(symbols):
 @pytest.mark.parametrize("kwargs", [
     {"days": 0}, {"days": 20000}, {"days": -5},
     {"fund": 1}, {"fund": 10 ** 12},
-    {"speed": 0}, {"speed": -1},
+    {"speed": -1},
     {"mode": "real"}, {"mode": "nonsense"},
     {"start_date": "yesterday"},
 ])
@@ -266,6 +266,18 @@ def test_run_config_bounds_every_number(kwargs):
     bars for minutes before anything can interrupt it."""
     with pytest.raises(SupervisorError):
         _parse(symbols=["2317"], **kwargs)
+
+
+
+def test_speed_zero_means_flat_out_and_is_allowed():
+    """0 is how you ask for an unpaced replay. The engine honours the speed in
+    backtest now, so without this there would be no way to ask for the
+    behaviour every backtest had before the setting meant anything."""
+    assert _parse(symbols=["2317"], speed=0).speed == 0
+
+
+def test_a_paced_speed_survives_parsing():
+    assert _parse(symbols=["2317"], speed=1200).speed == 1200.0
 
 
 def test_run_config_allows_an_empty_start_date():

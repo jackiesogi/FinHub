@@ -127,8 +127,12 @@ class RunConfig:
             raise SupervisorError("days must be between 1 and 1825 (5 years)")
         if not 1_000 <= fund <= 1_000_000_000:
             raise SupervisorError("fund must be between 1,000 and 1,000,000,000")
-        if not 0 < speed <= 100_000:
-            raise SupervisorError("speed must be greater than 0")
+        # 0 is allowed and means "as fast as possible". The engine honours the
+        # speed in backtest now, so this is the only way to ask for an unpaced
+        # replay -- and it is what the UI defaults to, because that is how a
+        # backtest behaved before the speed meant anything.
+        if not 0 <= speed <= 100_000:
+            raise SupervisorError("speed must be 0 (flat out) or a positive number")
 
         start_date = str(raw.get("start_date") or "").strip()
         if start_date:
@@ -337,9 +341,13 @@ class RunSupervisor:
         argv = [self.uv_bin, "run", "arenaxd",
                 f"--backend={cfg.mode}", f"--port={cfg.arenax_port}"]
         env = dict(os.environ)
-        # The server reads its playback speed from config; in backtest mode the
-        # engine drives the clock itself and this only paces a watchable demo.
-        env["AX_BACKTEST_PLAYBACK_SPEED"] = str(cfg.speed)
+        # The server's own clock speed, which is a different thing from the
+        # engine's: under ReplayClock the engine steps the server's clock bar
+        # by bar, so this only matters to code that reads the server's clock
+        # directly. Clamped away from 0 because the server multiplies by it
+        # (start_date + elapsed * speed), where 0 means a frozen clock -- and
+        # 0 here means the opposite, "do not pace the engine".
+        env["AX_BACKTEST_PLAYBACK_SPEED"] = str(cfg.speed if cfg.speed > 0 else 1.0)
         self._children.append(self._spawn("broker", argv, env))
 
     def _spawn_engine(self, cfg: RunConfig) -> None:
