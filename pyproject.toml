@@ -1,7 +1,7 @@
 [project]
 name = "finhub"
-version = "0.1.0"
-description = "manage your account locally"
+version = "0.2.0"
+description = "Front end for the CJTrade trading engine: run control, bot monitoring, manual trading"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -9,9 +9,11 @@ dependencies = [
     "cryptography>=48.0.0",
     "email-validator>=2.3.0",
     "fastapi>=0.136.1",
+    # Server-side HTTP to the engine and the broker. The browser never talks to
+    # either of them directly -- see cjtrade/__init__.py for why.
+    "httpx>=0.28.1",
     "jinja2>=3.1.6",
     "passlib[bcrypt]>=1.7.4",
-    "psycopg2-binary>=2.9.12",
     "pydantic-settings>=2.14.0",
     "python-dotenv>=1.2.2",
     "python-jose[cryptography]>=3.5.0",
@@ -23,4 +25,5 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pre-commit>=4.6.0",
+    "pytest>=8.3.0",
 ]

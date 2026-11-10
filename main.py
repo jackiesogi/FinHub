@@ -1,649 +1,659 @@
-# from fastapi import FastAPI
+"""FinHub — the front end for the CJTrade trading engine.
 
-# app = FastAPI(title="OpenDataHub - Mini Depositar")
+Three things the UI needs and three sources for them, each the only one that
+can answer its own questions:
 
-# @app.get("/")
-# def read_root():
-#     return {"message": "Hello from OpenDataHub! 🚀 這是我的研究資料平台 demo"}
+    engine  (:8898, read-only)  what the bots are doing right now
+    broker  (:8802)             the account, the orders, the market
+    FinHub's own DB             that a run happened, and who placed what by hand
 
-# @app.get("/docs")
-# def docs():
-#     return {"redirect": "去 http://127.0.0.1:8000/docs 看自動 API 文件"}
-
-# @app.get("/hello/{name}")
-# def say_hello(name: str):
-#     return {"message": f"嗨，{name}！歡迎來到 OpenDataHub 🎉"}
-
-from fastapi import FastAPI, Depends, Request, HTTPException, status, Response
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse
-from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
-from sqlalchemy import or_, func
+Every one of those calls is made here, server-side. The browser talks only to
+FinHub — see cjtrade/__init__.py for why that is the whole design and not a
+detail.
+"""
+import asyncio
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
-from fastapi.staticfiles import StaticFiles
+from typing import Optional
 
-# Internal Module Imports
-from database import get_db, engine
+from fastapi import Depends
+from fastapi import FastAPI
+from fastapi import HTTPException
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+from fastapi.responses import PlainTextResponse
+from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from sqlalchemy import or_
+from sqlalchemy.orm import Session
+
+import auth
 import models
 import schemas
-import auth
 from auth import get_current_user
-from services import LedgerService
-from contextlib import asynccontextmanager
+from cjtrade import ArenaXClient
+from cjtrade import BrokerError
+from cjtrade import EngineClient
+from cjtrade import EngineUnavailable
+from cjtrade import RunConfig
+from cjtrade import RunSupervisor
+from cjtrade import SupervisorError
 from config import settings
+from database import engine as db_engine
+from database import get_db
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)-7s %(name)s: %(message)s",
+)
+log = logging.getLogger("finhub")
 
-
-# --- Configuration ---
 BASE_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-# --- Lifespan Management ---
+engine_client = EngineClient(settings.engine_base_url)
+broker_client = ArenaXClient(settings.arenax_base_url, settings.ARENAX_API_KEY)
+supervisor = RunSupervisor(repo=settings.CJTRADE_REPO, uv_bin=settings.UV_BIN,
+                           log_dir=settings.RUN_LOG_DIR)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Lifespan
+# ══════════════════════════════════════════════════════════════════════════════
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    models.Base.metadata.create_all(bind=db_engine)
+    log.info("engine status API : %s", settings.engine_base_url)
+    log.info("arenax broker     : %s", settings.arenax_base_url)
+    log.info("cjtrade checkout  : %s%s", settings.CJTRADE_REPO,
+             "" if settings.CJTRADE_REPO.is_dir() else "  (NOT FOUND)")
+    watcher = asyncio.create_task(_watch_run(), name="run_watcher")
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        # This is the lifetime tie the supervisor exists for: closing FinHub
+        # closes the run it started, rather than leaving an engine trading into
+        # a broker with nobody watching either.
+        await supervisor.shutdown()
+
+
+async def _watch_run() -> None:
+    """Notice when the engine process ends and close out its Run row.
+
+    Polling rather than waiting on the process: the row has to be updated from
+    the engine's *last reported* state, and that has to be read before the
+    status API goes away with the process. So this samples while it is alive
+    and writes what it last saw once it is not.
     """
-    Handles application startup and shutdown events.
-    Replaces the deprecated @app.on_event("startup") pattern.
+    from database import SessionLocal
+
+    # The engine's own numbers, kept from the last successful poll. They have
+    # to be remembered rather than fetched at the end, because the thing that
+    # reports them is the process that just exited.
+    last_status: dict = {}
+    last_trips: dict = {}
+
+    while True:
+        try:
+            await asyncio.sleep(2.0)
+            run_id = supervisor.run_id
+            # Nothing to watch, or the engine has not been spawned yet. The
+            # second case is the whole reason this is not just `not busy`:
+            # starting a run sets the run id and then waits for the broker, so
+            # for up to a minute and a half there is a run with no engine, and
+            # treating that as "the engine has exited" finalised runs before
+            # they began.
+            if run_id is None or not supervisor.engine_started:
+                continue
+
+            if supervisor.engine_alive:
+                try:
+                    status = await engine_client.status()
+                except EngineUnavailable:
+                    status = None       # status site already torn down
+                if status:
+                    last_status = status
+                    with SessionLocal() as db:
+                        run = db.get(models.Run, run_id)
+                        if run is not None and run.status == "starting":
+                            run.status = "running"
+                            run.session_id = status.get("session_id")
+                            db.commit()
+                    try:
+                        trips = await engine_client.roundtrips()
+                        if trips and trips.get("available"):
+                            last_trips = trips
+                    except EngineUnavailable:
+                        pass
+                continue
+
+            # The engine is gone. Write what it last said, then release the
+            # broker it was driving.
+            exit_code = supervisor.engine_exit()
+            with SessionLocal() as db:
+                run = db.get(models.Run, run_id)
+                if run is not None and run.ended_at is None:
+                    _finalise_run(run, last_status, last_trips, exit_code,
+                                  supervisor.tail(400))
+                    db.commit()
+                    log.info("run %s %s (exit %s)", run_id, run.status, exit_code)
+            last_status, last_trips = {}, {}
+            # Stops the leftover broker. Deliberate: a server reused across two
+            # runs hands the second one the first one's balance, because
+            # AX_STATE_FILE is commented out in every .cjsys and fresh state is
+            # per server process. Ending it here is what makes the next run
+            # start from a clean account.
+            await supervisor.stop()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("run watcher hiccup — continuing")
+
+
+def _finalise_run(run: models.Run, status: dict, trips: dict,
+                  exit_code: Optional[int], tail: str) -> None:
+    """Copy the engine's last word onto the Run row.
+
+    Done from remembered samples rather than a fresh read, because by now there
+    is no engine to ask. A run whose engine never reported anything keeps
+    nulls, which is the honest answer and is why the UI offers the log for
+    those instead of a summary.
     """
-    # [Startup]: Logic to execute when the server starts
-    # Create database tables if they do not exist
-    models.Base.metadata.create_all(bind=engine)
+    run.ended_at = datetime.utcnow()
+    run.exit_code = exit_code
 
-    yield  # Control is handed over to the FastAPI application
+    # A run someone stopped on purpose keeps that status: "stopped" and
+    # "failed" are different facts and the UI shows them differently.
+    if run.status == "stopped":
+        pass
+    elif exit_code not in (0, None):
+        run.status = "failed"
+        # The last few lines are where the traceback is; the whole tail would
+        # not fit in a column worth reading.
+        run.error = "\n".join(tail.strip().splitlines()[-12:]) or None
+    else:
+        run.status = "finished"
 
-    # [Shutdown]: Logic to execute when the server stops
-    # (e.g., closing database connection pools or clearing cache)
-    pass
+    progress = status.get("progress") or {}
+    equity = status.get("equity") or {}
+    risk = status.get("risk") or {}
+    run.bars_served = progress.get("bars_served")
+    run.final_equity = equity.get("current")
+    run.pnl = equity.get("pnl")
+    run.halt_reason = risk.get("halt_reason")
+    if run.session_id is None:
+        run.session_id = status.get("session_id")
 
-# --- FastAPI Initialization ---
+    run.fills = trips.get("fills")
+    run.round_trips = trips.get("closed")
+    run.win_rate = trips.get("win_rate_pct")
+
+
+def _audit(db: Session, user: models.User, action: str, target: str = "",
+           details: str = "") -> None:
+    db.add(models.AuditLog(user_id=user.id, action=action, target=str(target),
+                           details=details))
+
 
 app = FastAPI(
-    title="FinTechHub Secure",
-    description="Enterprise Ledger with Field-Level Encryption.",
-    version="2.2.0",
-    lifespan=lifespan
+    title="FinHub",
+    description="Front end for the CJTrade trading engine: run control, "
+                "bot monitoring, manual trading.",
+    version="0.2.0",
+    lifespan=lifespan,
 )
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")),
+          name="static")
 
-# --- Static Files Configuration ---
 
-# Mount the static directory to serve CSS, JS, and images
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# ══════════════════════════════════════════════════════════════════════════════
+#  Pages
+# ══════════════════════════════════════════════════════════════════════════════
 
-# --- Frontend Shell (SSR) ---
+PAGES = ("dashboard", "runs", "bots", "positions", "orders", "market",
+         "trade", "audit")
+
 
 @app.get("/", response_class=HTMLResponse, tags=["Frontend"])
 async def home(request: Request):
-    # ✅ 新的響應式設計
-    return templates.TemplateResponse(request, "index_responsive.html")
-
-@app.get("/classic", response_class=HTMLResponse, tags=["Frontend"])
-async def home_classic(request: Request):
-    # 舊版設計（備用）
     return templates.TemplateResponse(request, "index.html")
+
 
 @app.get("/login", response_class=HTMLResponse, tags=["Frontend"])
 async def login_page(request: Request):
     return templates.TemplateResponse(request, "login.html")
 
+
 @app.get("/register", response_class=HTMLResponse, tags=["Frontend"])
 async def register_page(request: Request):
     return templates.TemplateResponse(request, "register.html")
 
-# --- IAM API ---
 
-@app.post("/api/v1/auth/register", response_model=schemas.UserSchema, tags=["Auth"])
+# ══════════════════════════════════════════════════════════════════════════════
+#  Identity
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/v1/auth/register", response_model=schemas.UserSchema,
+          tags=["Auth"])
 def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
-    """Handles secure user registration."""
-    db_user = db.query(models.User).filter(
-        or_(models.User.username == user_in.username, models.User.email == user_in.email)
-    ).first()
-    if db_user:
+    existing = db.query(models.User).filter(
+        or_(models.User.username == user_in.username,
+            models.User.email == user_in.email)).first()
+    if existing:
         raise HTTPException(status_code=400, detail="Identity already exists.")
-
-    new_user = models.User(
-        username=user_in.username,
-        email=user_in.email,
-        hashed_password=auth.hash_password(user_in.password)
-    )
-    db.add(new_user)
+    user = models.User(username=user_in.username, email=user_in.email,
+                       hashed_password=auth.hash_password(user_in.password))
+    db.add(user)
     db.commit()
-    db.refresh(new_user)
-    return new_user
+    db.refresh(user)
+    return user
+
 
 @app.post("/api/v1/auth/login", tags=["Auth"])
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    """Authenticates credentials and issues JWT token."""
-    user = db.query(models.User).filter(models.User.username == form_data.username).first()
-    if not user or not auth.verify_password(form_data.password, user.hashed_password):
+def login(form_data: OAuth2PasswordRequestForm = Depends(),
+          db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(
+        models.User.username == form_data.username).first()
+    if not user or not auth.verify_password(form_data.password,
+                                            user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials.")
-
-    token = auth.create_access_token(data={"sub": user.username})
-    return {"access_token": token, "token_type": "bearer"}
-
-# --- Finance API ---
-
-@app.get("/api/v1/dashboard", tags=["Finance"])
-def get_dashboard_summary(
-    account_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """Calculates financial KPIs by decrypting and aggregating transactions."""
-    tx_query = db.query(models.Transaction).filter(models.Transaction.owner_id == current_user.id)
-
-    if account_id:
-        tx_query = tx_query.filter(models.Transaction.account_id == account_id)
-        account = db.query(models.Account).filter(models.Account.id == account_id).first()
-        total_balance = account.balance if account else 0
-    else:
-        total_balance = db.query(func.sum(models.Account.balance)).filter(
-            models.Account.owner_id == current_user.id
-        ).scalar() or 0
-
-    txs = tx_query.all()
-    # Decrypt records in-memory via Service Layer
-    processed_txs = LedgerService.get_processed_transactions(txs)
-
-    income = sum(t.amount for t in processed_txs if t.transaction_type == "income")
-    expense = sum(t.amount for t in processed_txs if t.transaction_type == "expense")
-
-    return {"total_income": income, "total_expense": expense, "balance": total_balance}
-
-@app.get("/api/v1/accounts", response_model=List[schemas.AccountSchema], tags=["Finance"])
-def list_accounts(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    return db.query(models.Account).filter(models.Account.owner_id == current_user.id).all()
-
-@app.post("/api/v1/accounts", status_code=201, tags=["Finance"])
-def create_account(account_in: schemas.AccountCreate, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    new_acc = models.Account(**account_in.dict(), owner_id=current_user.id)
-    db.add(new_acc)
-    db.commit()
-    db.refresh(new_acc)
-    return new_acc
-
-@app.delete("/api/v1/accounts/{account_id}", tags=["Finance"])
-def delete_account(account_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    return LedgerService.delete_account(db, account_id, current_user.id)
-
-@app.get("/api/v1/transactions", response_model=List[schemas.TransactionSchema], tags=["Finance"])
-def list_transactions(
-    account_id: Optional[int] = None,
-    sort_by: Optional[str] = "date_desc",
-    skip: int = 0,    # Offset for pagination
-    limit: int = 20,  # Max records per request to prevent OOM (Out of Memory)
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    """Fetches paginated transactions with server-side filtering."""
-    query = db.query(models.Transaction).filter(models.Transaction.owner_id == current_user.id)
-    if account_id:
-        query = query.filter(models.Transaction.account_id == account_id)
-
-    # Apply limit and offset at the database level before fetching to memory
-    db_txs = query.offset(skip).limit(limit).all()
-    processed_txs = LedgerService.get_processed_transactions(db_txs)
-
-    # In-memory sorting remains necessary due to field-level encryption (ciphertexts cannot be sorted via SQL)
-    sort_map = {
-        "date_asc": (lambda x: x.date, False),
-        "date_desc": (lambda x: x.date, True),
-        "amount_asc": (lambda x: x.amount, False),
-        "amount_desc": (lambda x: x.amount, True),
-    }
-
-    if sort_by in sort_map:
-        key_func, is_reverse = sort_map[sort_by]
-        processed_txs.sort(key=key_func, reverse=is_reverse)
-
-    return processed_txs
-
-@app.post("/api/v1/transactions", status_code=201, tags=["Finance"])
-def create_transaction(tx_in: schemas.TransactionCreate, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    return LedgerService.create_transaction(db, tx_in, current_user.id)
-
-@app.delete("/api/v1/transactions/{tx_id}", tags=["Finance"])
-def delete_transaction(tx_id: int, db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    return LedgerService.delete_transaction(db, tx_id, current_user.id)
-
-@app.get("/api/v1/audit-logs", tags=["Security"])
-def get_audit_logs(db: Session = Depends(get_db), current_user = Depends(get_current_user)):
-    return db.query(models.AuditLog).filter(models.AuditLog.user_id == current_user.id).order_by(models.AuditLog.timestamp.desc()).all()
-
-@app.put("/api/v1/transactions/{tx_id}", tags=["Finance"])
-def update_transaction(
-    tx_id: int,
-    tx_in: schemas.TransactionCreate,
-    db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
-):
-    """Updates a transaction's details and synchronizes the account balance."""
-    return LedgerService.update_transaction(db, tx_id, tx_in, current_user.id)
-
-@app.post("/api/v1/transfers", tags=["Finance"], status_code=201)
-def internal_transfer(
-    transfer_in: schemas.TransferCreate,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """
-    Executes a secure internal transfer between two accounts owned by the user.
-    Ensures ACID compliance and encrypted audit trailing.
-    """
-    return LedgerService.transfer_funds(db, transfer_in, current_user.id)
-
-@app.get("/api/v1/admin/users", tags=["Admin"])
-def get_system_users(
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """
-    Administrative endpoint to monitor system growth.
-    Restricted to specific admin username for security.
-    """
-    # [SECURITY CHECK] Replace 'Eason' with your actual admin username
-    if current_user.username != "Eason":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Administrative privileges required."
-        )
-
-    users = db.query(models.User).all()
-
-    # [DATA AGGREGATION] Map user data and count their linked accounts
-    admin_data = []
-    for u in users:
-        admin_data.append({
-            "username": u.username,
-            "email": u.email,
-            "account_count": len(u.accounts)
-        })
-
-    return admin_data
+    return {"access_token": auth.create_access_token(data={"sub": user.username}),
+            "token_type": "bearer"}
 
 
-@app.delete("/api/v1/accounts/{account_id}/transactions", tags=["Finance"])
-def clear_account_transactions(
-    account_id: int,
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    """
-    清空特定帳戶的所有交易記錄，但保留帳戶本身。
-    帳戶餘額會重設為 0。
-    """
-    # 驗證帳戶所有權
-    account = db.query(models.Account).filter(
-        models.Account.id == account_id,
-        models.Account.owner_id == current_user.id
-    ).first()
+@app.get("/api/v1/auth/me", response_model=schemas.UserSchema, tags=["Auth"])
+def whoami(current_user: models.User = Depends(get_current_user)):
+    return current_user
 
-    if not account:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Account not found or you don't have permission."
-        )
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  Engine  — the live view of a run
+#
+#  Every route answers 200 with {"available": false} when there is no engine,
+#  because "no run in flight" is the normal state of this system and a 502
+#  would have the UI render an error for it.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _absent(reason: str = "no run in flight") -> dict:
+    return {"available": False, "reason": reason}
+
+
+@app.get("/api/v1/engine/status", tags=["Engine"])
+async def engine_status(current_user: models.User = Depends(get_current_user)):
     try:
-        # 刪除該帳戶的所有交易
-        db.query(models.Transaction).filter(
-            models.Transaction.account_id == account_id
-        ).delete()
+        status = await engine_client.status()
+    except EngineUnavailable as exc:
+        return _absent(str(exc))
+    return {"available": True, "status": status,
+            "supervisor": supervisor.describe()}
 
-        # 重設帳戶餘額
-        account.balance = 0.0
-        db.commit()
 
-        return {
-            "status": "success",
-            "message": f"Account '{account.name}' transactions cleared. Balance reset to 0.",
-            "account_id": account_id,
-            "account_name": account.name,
-            "new_balance": 0.0
-        }
-    except Exception as e:
-        db.rollback()
+@app.get("/api/v1/engine/bots", tags=["Engine"])
+async def engine_bots(current_user: models.User = Depends(get_current_user)):
+    try:
+        return {"available": True, "bots": await engine_client.bots()}
+    except EngineUnavailable as exc:
+        return _absent(str(exc))
+
+
+@app.get("/api/v1/engine/bots/{bot_id}/history", tags=["Engine"])
+async def engine_bot_history(bot_id: str, limit: int = 120,
+                             current_user: models.User = Depends(get_current_user)):
+    try:
+        history = await engine_client.bot_history(bot_id, limit=limit)
+    except EngineUnavailable as exc:
+        return _absent(str(exc))
+    if history is None:
+        raise HTTPException(status_code=404, detail=f"no such bot: {bot_id}")
+    return {"available": True, **history}
+
+
+@app.get("/api/v1/engine/equity", tags=["Engine"])
+async def engine_equity(limit: int = 1000,
+                        current_user: models.User = Depends(get_current_user)):
+    try:
+        return {"available": True, **(await engine_client.equity(limit=limit))}
+    except EngineUnavailable as exc:
+        return _absent(str(exc))
+
+
+@app.get("/api/v1/engine/roundtrips", tags=["Engine"])
+async def engine_roundtrips(current_user: models.User = Depends(get_current_user)):
+    try:
+        return {"available": True, **(await engine_client.roundtrips())}
+    except EngineUnavailable as exc:
+        return _absent(str(exc))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Broker  — one route per shell command, see README for the mapping
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _broker_call(coro):
+    """Turn a BrokerError into a 502 with the broker's own words.
+
+    502 and not 500: the fault is upstream, and saying so is the difference
+    between "FinHub is broken" and "start the ArenaX server".
+    """
+    async def run():
+        try:
+            return await coro
+        except BrokerError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+    return run()
+
+
+@app.get("/api/v1/broker/health", tags=["Broker"])
+async def broker_health(current_user: models.User = Depends(get_current_user)):
+    try:
+        return {"available": True, **(await broker_client.health())}
+    except BrokerError as exc:
+        return _absent(str(exc))
+
+
+@app.get("/api/v1/broker/account", tags=["Broker"])
+async def broker_account(current_user: models.User = Depends(get_current_user)):
+    """balance + lspos + lsodr in one read."""
+    return await _broker_call(broker_client.account())
+
+
+@app.get("/api/v1/broker/orders", tags=["Broker"])
+async def broker_orders(current_user: models.User = Depends(get_current_user)):
+    """lsodr."""
+    return {"orders": await _broker_call(broker_client.orders())}
+
+
+@app.get("/api/v1/broker/fills", tags=["Broker"])
+async def broker_fills(session_id: Optional[str] = None,
+                       current_user: models.User = Depends(get_current_user)):
+    """Fill history with the commission and tax the broker charged."""
+    return await _broker_call(broker_client.fills(session_id=session_id))
+
+
+@app.get("/api/v1/broker/snapshot", tags=["Broker"])
+async def broker_snapshot(symbols: str,
+                          current_user: models.User = Depends(get_current_user)):
+    """ohlcv. `symbols` is comma separated, as the shell takes them."""
+    wanted = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+    if not wanted:
+        raise HTTPException(status_code=422, detail="no symbols given")
+    if len(wanted) > 20:
+        raise HTTPException(status_code=422, detail="at most 20 symbols")
+    return {"snapshots": await _broker_call(broker_client.snapshots(wanted))}
+
+
+@app.get("/api/v1/broker/kbars", tags=["Broker"])
+async def broker_kbars(symbol: str, start: str, end: str, interval: str = "1m",
+                       current_user: models.User = Depends(get_current_user)):
+    """kbars / replay. Range is [start, end) — end is exclusive."""
+    return {"symbol": symbol,
+            "kbars": await _broker_call(
+                broker_client.kbars(symbol.strip().upper(), start, end, interval))}
+
+
+@app.get("/api/v1/broker/clock", tags=["Broker"])
+async def broker_clock(current_user: models.User = Depends(get_current_user)):
+    """date / info. Naive Asia/Taipei — do not convert it in the UI."""
+    clock = await _broker_call(broker_client.clock())
+    return {"clock": clock,
+            "market_open": await _broker_call(broker_client.is_market_open())}
+
+
+@app.post("/api/v1/broker/orders", response_model=schemas.ManualOrderSchema,
+          tags=["Broker"])
+async def place_manual_order(order_in: schemas.OrderCreate,
+                             db: Session = Depends(get_db),
+                             current_user: models.User = Depends(get_current_user)):
+    """buy / sell, by hand.
+
+    Read this before using it: a manual order goes straight to the broker, so
+    the engine's RiskGate never sees it. The per-bot allocation, the orders-
+    per-bar limit, the duplicate check and the kill switch do not apply. The
+    broker still checks what a broker checks — price, quantity, trading limit,
+    balance, inventory — and refuses with a reason, which comes back as a
+    REJECTED status rather than an error.
+
+    It is also invisible to the bots: their ledger mirrors are built from the
+    engine's order reports, so a manual fill moves the real balance underneath
+    a bot that does not know it happened. Hence the audit row and the `confirm`
+    flag.
+    """
+    if not order_in.confirm:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to clear transactions: {str(e)}"
-        )
+            status_code=422,
+            detail="A manual order bypasses the engine's risk gate. "
+                   "Set confirm=true to acknowledge.")
 
-
-@app.post("/api/v1/cjtrade/sync-incremental/{account_id}", tags=["CJTrade"])
-def cjtrade_sync_incremental(
-    account_id: int,
-    since: Optional[str] = None,
-    cjtrade_url: str = "http://localhost:8899",
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Append only trades newer than *since* (ISO timestamp) from CJTrade.
-
-    Does NOT clear existing transactions.  Designed for periodic polling.
-    Returns the number of new entries written and the latest trade timestamp
-    seen (to be stored client-side for the next call).
-    """
-    import json as _json
-    import urllib.request as _urllib_req
-    from datetime import datetime as _dt
-
-    account = db.query(models.Account).filter(
-        models.Account.id == account_id,
-        models.Account.owner_id == current_user.id,
-    ).first()
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found.")
-
-    def _get(path: str):
-        req = _urllib_req.Request(
-            f"{cjtrade_url}{path}",
-            headers={"Authorization": "Bearer cjtrade-finhub-backend"},
-        )
-        with _urllib_req.urlopen(req, timeout=5) as resp:  # noqa: S310
-            return _json.loads(resp.read())
-
-    try:
-        trades_data = _get("/api/v1/trades")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"CJTrade unreachable: {exc}")
-
-    # Parse the since cutoff
-    since_dt = None
-    if since:
-        try:
-            since_dt = _dt.fromisoformat(since)
-        except ValueError:
-            raise HTTPException(status_code=422, detail=f"Invalid since timestamp: {since}")
-
-    # trades arrive newest-first; reverse to process oldest→newest
-    new_entries = []
-    latest_ts = since
-
-    for trade in reversed(trades_data):
-        # Skip orders that were not filled
-        if trade.get('order_status', '').upper() != 'FILLED':
-            continue
-        try:
-            ts = _dt.fromisoformat(trade.get("timestamp", ""))
-        except Exception:
-            continue
-
-        if since_dt and ts <= since_dt:
-            continue  # already imported
-
-        action = trade.get("action", "")
-        symbol = trade.get("symbol", "")
-        qty    = trade.get("quantity", 0)
-        price  = trade.get("price", 0.0)
-        amount = round(price * qty, 2)
-
-        if action == "BUY":
-            tx_type = "expense"
-            desc    = f"買入 {symbol} ×{qty} @{price}"
-        else:
-            tx_type = "income"
-            desc    = f"賣出 {symbol} ×{qty} @{price}"
-
-        db.add(models.Transaction(
-            description=desc,
-            amount=amount,
-            category="Trading",
-            transaction_type=tx_type,
-            account_id=account_id,
-            owner_id=current_user.id,
-            date=ts,
-        ))
-        if tx_type == "income":
-            account.balance += amount
-        else:
-            account.balance -= amount
-
-        latest_ts = ts.isoformat()
-        new_entries.append(desc)
-
-    if new_entries:
-        db.add(models.AuditLog(
-            user_id=current_user.id,
-            action="CJTRADE_INCREMENTAL_SYNC",
-            target_id=account_id,
-            details=f"Appended {len(new_entries)} new trades since {since}",
-        ))
-        try:
-            db.commit()
-        except Exception as exc:
-            db.rollback()
-            raise HTTPException(status_code=500, detail=f"DB error: {exc}")
-
-    return {
-        "imported":       len(new_entries),
-        "latest_timestamp": latest_ts,
-    }
-
-
-@app.post("/api/v1/cjtrade/sync/{account_id}", tags=["CJTrade"])
-def cjtrade_sync_account(
-    account_id: int,
-    cjtrade_url: str = "http://localhost:8899",
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user),
-):
-    """Reset an account's transactions and re-import from CJTrade.
-
-    Steps:
-    1. Verify account ownership.
-    2. Clear all existing transactions + reset balance to 0.
-    3. Fetch ``initial_equity`` and ``trades`` from CJTrade.
-    4. Bulk-insert: one INITIAL income entry + one entry per trade (BUY=expense, SELL=income).
-    5. Write an audit log entry.
-    """
-    import json as _json
-    import urllib.request as _urllib_req
-
-    # ── 1. ownership check ────────────────────────────────────────────────────
-    account = db.query(models.Account).filter(
-        models.Account.id == account_id,
-        models.Account.owner_id == current_user.id,
-    ).first()
-    if not account:
-        raise HTTPException(status_code=404, detail="Account not found.")
-
-    # ── 2. fetch from CJTrade ─────────────────────────────────────────────────
-    def _get(path: str):
-        req = _urllib_req.Request(
-            f"{cjtrade_url}{path}",
-            headers={"Authorization": "Bearer cjtrade-finhub-backend"},
-        )
-        with _urllib_req.urlopen(req, timeout=5) as resp:  # noqa: S310
-            return _json.loads(resp.read())
-
-    try:
-        acct_data   = _get("/api/v1/account")
-        trades_data = _get("/api/v1/trades")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"CJTrade unreachable: {exc}")
-
-    # ── 3. clear existing transactions ────────────────────────────────────────
-    db.query(models.Transaction).filter(
-        models.Transaction.account_id == account_id,
-    ).delete(synchronize_session=False)
-    account.balance = 0.0
-
-    # ── 4. build entry list ───────────────────────────────────────────────────
-    from datetime import datetime as _dt
-
-    cash_balance = acct_data.get("balance", 0.0)
-    launch_mode  = acct_data.get("launch_mode", "unknown")
-    session_id   = acct_data.get("session_id", "")
-
-    entries = [{
-        "description":       f"CJTrade 初始現金 [{launch_mode}]",
-        "amount":            cash_balance,
-        "category":          "Trading",
-        "transaction_type":  "income",
-        "date":              _dt.now(),
-    }]
-
-    # trades arrive newest-first; reverse so balance progresses chronologically
-    for trade in reversed(trades_data):
-        # Skip orders that were not filled
-        if trade.get('order_status', '').upper() != 'FILLED':
-            continue
-        action = trade.get("action", "")
-        symbol = trade.get("symbol", "")
-        qty    = trade.get("quantity", 0)
-        price  = trade.get("price", 0.0)
-        amount = round(price * qty, 2)
-        try:
-            ts = _dt.fromisoformat(trade.get("timestamp", ""))
-        except Exception:
-            ts = _dt.now()
-
-        if action == "BUY":
-            tx_type = "expense"
-            desc    = f"買入 {symbol} ×{qty} @{price}"
-        else:
-            tx_type = "income"
-            desc    = f"賣出 {symbol} ×{qty} @{price}"
-
-        entries.append({
-            "description":      desc,
-            "amount":           amount,
-            "category":         "Trading",
-            "transaction_type": tx_type,
-            "date":             ts,
-        })
-
-    # ── 5. bulk insert ────────────────────────────────────────────────────────
-    for e in entries:
-        db.add(models.Transaction(
-            description=e["description"],
-            amount=e["amount"],
-            category=e["category"],
-            transaction_type=e["transaction_type"],
-            account_id=account_id,
-            owner_id=current_user.id,
-            date=e["date"],
-        ))
-        if e["transaction_type"] == "income":
-            account.balance += e["amount"]
-        else:
-            account.balance -= e["amount"]
-
-    db.add(models.AuditLog(
-        user_id=current_user.id,
-        action="CJTRADE_SYNC",
-        target_id=account_id,
-        details=(
-            f"Reset & imported {len(entries)} entries from CJTrade "
-            f"[{launch_mode}] session={session_id}"
-        ),
+    result = await _broker_call(broker_client.place_order(
+        symbol=order_in.symbol.strip().upper(),
+        action=order_in.action,
+        quantity=order_in.quantity,
+        price=order_in.price,
+        odd_lot=order_in.odd_lot,
+        # Tagged, so this order is identifiable in the broker's fill history
+        # as not having come from a bot. The engine filters its own report by
+        # session_id, so an untagged manual fill would be silently excluded
+        # from the run report while still having moved the balance.
+        opt_field={"source": "finhub-manual", "user": current_user.username},
     ))
 
+    record = models.ManualOrder(
+        owner_id=current_user.id,
+        run_id=supervisor.run_id,
+        order_id=result["order_id"],
+        symbol=order_in.symbol.strip().upper(),
+        action=order_in.action,
+        quantity=order_in.quantity,
+        price=order_in.price,
+        order_lot="IntraDayOdd" if order_in.odd_lot else "Common",
+        status=result["status"],
+        message=result["message"],
+    )
+    db.add(record)
+    _audit(db, current_user, "MANUAL_ORDER", result["order_id"],
+           f"{order_in.action} {order_in.symbol} x{order_in.quantity} "
+           f"@ {order_in.price} -> {result['status']}")
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+@app.get("/api/v1/broker/manual-orders",
+         response_model=list[schemas.ManualOrderSchema], tags=["Broker"])
+def list_manual_orders(limit: int = 50, db: Session = Depends(get_db),
+                       current_user: models.User = Depends(get_current_user)):
+    """Which orders a human placed. The broker cannot answer this."""
+    return (db.query(models.ManualOrder)
+            .filter(models.ManualOrder.owner_id == current_user.id)
+            .order_by(models.ManualOrder.id.desc())
+            .limit(max(1, min(limit, 500))).all())
+
+
+@app.delete("/api/v1/broker/orders/{order_id}", tags=["Broker"])
+async def cancel_order(order_id: str, db: Session = Depends(get_db),
+                       current_user: models.User = Depends(get_current_user)):
+    result = await _broker_call(broker_client.cancel_order(order_id))
+    _audit(db, current_user, "CANCEL_ORDER", order_id, result["status"])
+    db.commit()
+    return result
+
+
+@app.post("/api/v1/broker/orders/cancel-all", tags=["Broker"])
+async def cancel_all_orders(db: Session = Depends(get_db),
+                            current_user: models.User = Depends(get_current_user)):
+    """The shell's `cancel`: every order the broker will still cancel.
+
+    Including a bot's. A run in flight will find its resting order gone and
+    report it as cancelled to the bot, which is handled — but it is the bot's
+    plan you just changed, so the UI asks first.
+    """
+    results = await _broker_call(broker_client.cancel_all())
+    cancelled = [r for r in results if not r.get("skipped")
+                 and r.get("status") == "CANCELLED"]
+    _audit(db, current_user, "CANCEL_ALL", "",
+           f"{len(cancelled)} cancelled of {len(results)} order(s)")
+    db.commit()
+    return {"results": results, "cancelled": len(cancelled),
+            "examined": len(results)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Runs
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/runs", response_model=list[schemas.RunSchema], tags=["Runs"])
+def list_runs(limit: int = 50, db: Session = Depends(get_db),
+              current_user: models.User = Depends(get_current_user)):
+    return (db.query(models.Run)
+            .filter(models.Run.owner_id == current_user.id)
+            .order_by(models.Run.id.desc())
+            .limit(max(1, min(limit, 200))).all())
+
+
+@app.get("/api/v1/runs/{run_id}", response_model=schemas.RunSchema, tags=["Runs"])
+def get_run(run_id: int, db: Session = Depends(get_db),
+            current_user: models.User = Depends(get_current_user)):
+    run = db.get(models.Run, run_id)
+    if run is None or run.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    return run
+
+
+@app.post("/api/v1/runs", response_model=schemas.RunSchema, status_code=201,
+          tags=["Runs"])
+async def start_run(run_in: schemas.RunCreate, db: Session = Depends(get_db),
+                    current_user: models.User = Depends(get_current_user)):
+    """Start a backtest: bring up the broker, then the engine.
+
+    Authenticated, because this spawns processes on the host. It runs a fixed
+    program with validated arguments and no shell, so the request cannot choose
+    what to execute — only how the engine is configured. `RunConfig.parse`
+    bounds every number, because `days` becomes a replay length and an absurd
+    one would have the engine fetching bars for minutes before anything could
+    interrupt it.
+    """
     try:
+        cfg = RunConfig.parse(run_in.model_dump(),
+                              default_arenax_port=settings.ARENAX_PORT,
+                              default_status_port=settings.ENGINE_STATUS_PORT)
+    except SupervisorError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    run = models.Run(
+        owner_id=current_user.id, broker=cfg.broker, mode=cfg.mode,
+        symbols=",".join(cfg.symbols), days=cfg.days, fund=cfg.fund,
+        speed=cfg.speed, start_date=cfg.start_date,
+        arenax_port=cfg.arenax_port, status_port=cfg.status_port,
+        status="starting",
+    )
+    db.add(run)
+    db.commit()
+    db.refresh(run)
+
+    try:
+        info = await supervisor.start(cfg, run.id)
+    except SupervisorError as exc:
+        run.status = "failed"
+        run.error = str(exc)
+        run.ended_at = datetime.utcnow()
         db.commit()
-    except Exception as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"DB error: {exc}")
+        db.refresh(run)
+        raise HTTPException(status_code=409, detail=str(exc))
 
-    return {
-        "status":       "success",
-        "imported":     len(entries),
-        "launch_mode":  launch_mode,
-        "session_id":   session_id,
-        "new_balance":  round(account.balance, 2),
-    }
+    run.log_path = info["log"]
+    # One slot per symbol. The engine spawns a single hardcoded Bot_C today, so
+    # this records the intent; when it takes more than one bot the UI already
+    # knows which strategy each id was meant to be.
+    db.add(models.BotSlot(run_id=run.id, bot_id="Bot_C", strategy="BB",
+                          symbol=cfg.symbols[0]))
+    _audit(db, current_user, "START_RUN", str(run.id),
+           f"{cfg.mode} {','.join(cfg.symbols)} days={cfg.days} "
+           f"fund={cfg.fund:g} start={cfg.start_date or 'server default'}")
+    db.commit()
+    db.refresh(run)
+    return run
 
 
-@app.post("/api/v1/admin/reset-db")
-def reset_database_endpoint(
-    db: Session = Depends(get_db),
-    # current_user: models.User = Depends(get_current_user)
-):
+@app.delete("/api/v1/runs/{run_id}", tags=["Runs"])
+async def stop_run(run_id: int, db: Session = Depends(get_db),
+                   current_user: models.User = Depends(get_current_user)):
+    """Stop a run: engine first, then the broker.
+
+    The engine's resting orders are cancelled by its own teardown, which is
+    why the broker has to still be there when it goes.
     """
-    Administrative endpoint to reset the entire database.
-    Clears all tables and recreates the schema.
-    Restricted to admin username for security.
-    No confirmation required - use with caution!
+    run = db.get(models.Run, run_id)
+    if run is None or run.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if supervisor.run_id != run_id:
+        raise HTTPException(status_code=409,
+                            detail="That run is not the one in flight.")
+
+    result = await supervisor.stop()
+    run.status = "stopped"
+    run.ended_at = datetime.utcnow()
+    _audit(db, current_user, "STOP_RUN", str(run_id), str(result))
+    db.commit()
+    return result
+
+
+@app.get("/api/v1/runs/{run_id}/log", response_class=PlainTextResponse,
+         tags=["Runs"])
+def run_log(run_id: int, lines: int = 300, db: Session = Depends(get_db),
+            current_user: models.User = Depends(get_current_user)):
+    """The run's captured stdout and stderr.
+
+    This is the only place a failure that happened before the engine's status
+    API came up is visible at all, which is exactly when you most want it.
     """
-    # [SECURITY CHECK] Only admin can reset database
-    # if current_user.username != "Eason":
-    #     raise HTTPException(
-    #         status_code=status.HTTP_403_FORBIDDEN,
-    #         detail="Administrative privileges required."
-    #     )
-
-    try:
-        # Close the current session to release any locks
-        db.close()
-
-        # Drop all tables
-        models.Base.metadata.drop_all(bind=engine)
-
-        # Recreate all tables
-        models.Base.metadata.create_all(bind=engine)
-
-        return {
-            "status": "success",
-            "message": "Database reset complete! All tables have been cleared and recreated.",
-            "timestamp": str(models.Base.metadata.tables)
-        }
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Database reset failed: {str(e)}"
-        )
+    run = db.get(models.Run, run_id)
+    if run is None or run.owner_id != current_user.id:
+        raise HTTPException(status_code=404, detail="Run not found.")
+    if not run.log_path:
+        return "This run never got as far as writing a log."
+    return (supervisor.tail(lines=max(1, min(lines, 5000)),
+                            path=Path(run.log_path))
+            or "(log is empty)")
 
 
-# --- Catch-All Route for SPA Routing ---
-# Must be placed after all specific routes!
+@app.get("/api/v1/supervisor", tags=["Runs"])
+def supervisor_state(current_user: models.User = Depends(get_current_user)):
+    """What FinHub currently has running, and where CJTrade is."""
+    return supervisor.describe()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Audit
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/v1/audit", response_model=list[schemas.AuditLogSchema],
+         tags=["Audit"])
+def audit_logs(limit: int = 100, db: Session = Depends(get_db),
+               current_user: models.User = Depends(get_current_user)):
+    return (db.query(models.AuditLog)
+            .filter(models.AuditLog.user_id == current_user.id)
+            .order_by(models.AuditLog.id.desc())
+            .limit(max(1, min(limit, 500))).all())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SPA fallback. Last, so it cannot shadow a real route.
+# ══════════════════════════════════════════════════════════════════════════════
 
 @app.get("/{path_name:path}", response_class=HTMLResponse, tags=["Frontend"])
 async def catch_all(path_name: str, request: Request):
+    """Serve the shell for a known page so a refresh keeps you where you were.
+
+    An allowlist rather than "anything that is not an API path": a typo should
+    be a 404, not a blank dashboard that looks like a bug in the page.
     """
-    Catch-all route for Single Page Application (SPA) routing.
-
-    Allows the frontend to handle URL routing while serving the same HTML shell.
-    This enables URL persistence for pages like /dashboard, /assets, /audit
-    without full page reloads.
-
-    ✅ Benefits:
-    - URL reflects current page state
-    - Page refresh maintains current section
-    - Supports sharing URLs
-    - Browser back/forward buttons work
-    - No duplicate HTML files needed
-
-    Flow:
-    1. User accesses /dashboard → Returns index_responsive.html
-    2. Frontend's getPageFromURL() reads /dashboard
-    3. showSection('dashboard') is called
-    4. Dashboard page is displayed
-    """
-
-    # List of valid pages that should be served by SPA
-    valid_pages = {
-        "dashboard",      # Main financial dashboard
-        "assets",         # Portfolio/holdings overview
-        "audit",          # Security audit trail
-        "settings",       # (Future) User settings
-        "profile",        # (Future) User profile
-    }
-
-    # Extract the first path segment
-    # e.g., /dashboard/detail → dashboard
-    path_segments = path_name.strip("/").split("/") if path_name else []
-    page = path_segments[0] if path_segments and path_segments[0] else ""
-
-    # 🔍 Validation: Check if it's a valid SPA page
-    if page in valid_pages or not page:
-        # ✅ Valid page - serve the SPA shell
-        # The frontend will read the URL and display the correct section
-        return templates.TemplateResponse(request, "index_responsive.html")
-
-    # ❌ Invalid page - return 404
-    raise HTTPException(
-        status_code=404,
-        detail=f"Page '{page}' not found. Valid pages: {', '.join(valid_pages)}"
-    )
+    page = (path_name.strip("/").split("/") or [""])[0]
+    if not page or page in PAGES:
+        return templates.TemplateResponse(request, "index.html")
+    raise HTTPException(status_code=404,
+                        detail=f"No page {page!r}. Try: {', '.join(PAGES)}")

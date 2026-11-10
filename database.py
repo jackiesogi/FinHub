@@ -1,36 +1,40 @@
 import os
-from sqlalchemy import create_engine, event
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
+
+from sqlalchemy import create_engine
+from sqlalchemy import event
 from sqlalchemy.engine import Engine
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-# --- FIXED: Use Absolute Path to prevent data loss on refresh/restart ---
-# This ensures the database file is always in the same folder as this script
+from config import settings
+
+# Absolute, so the DB does not follow the working directory the process
+# happened to start in.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "fintech_ledger.db")
-SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
+DEFAULT_SQLITE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'finhub.db')}"
 
-# Create the SQLAlchemy engine
-# 'check_same_thread': False is required specifically for SQLite + FastAPI
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
-)
+SQLALCHEMY_DATABASE_URL = settings.DATABASE_URL or DEFAULT_SQLITE_URL
 
-# --- CRITICAL: SQLite Foreign Key Enabler ---
-# This listener ensures that 'ON DELETE CASCADE' is respected by SQLite.
+# check_same_thread is a SQLite-only argument; passing it to Postgres fails.
+_connect_args = ({"check_same_thread": False}
+                 if SQLALCHEMY_DATABASE_URL.startswith("sqlite") else {})
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args=_connect_args)
+
+
 @event.listens_for(Engine, "connect")
 def set_sqlite_pragma(dbapi_connection, connection_record):
-    cursor = dbapi_connection.cursor()
-    cursor.execute("PRAGMA foreign_keys=ON")
-    cursor.close()
+    """SQLite ignores ON DELETE CASCADE unless foreign keys are switched on."""
+    if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
 
-# Create SessionLocal class for database operations
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Base class for DB models
 Base = declarative_base()
 
-# Dependency to get DB session in FastAPI routes
+
 def get_db():
     db = SessionLocal()
     try:

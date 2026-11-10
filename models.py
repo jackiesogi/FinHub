@@ -1,13 +1,33 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime
+"""What FinHub itself stores.
+
+Deliberately small. FinHub is a front end: the authority on an account is the
+broker and the authority on a run in flight is the engine, so copying either
+into this database would only create a second answer that can disagree. What
+lives here is what nothing else keeps:
+
+* `Run`     -- that a run happened, how it was configured, and how it ended.
+              The engine forgets a run the moment its process exits.
+* `BotSlot` -- which strategy was asked to run under which bot id.
+* `ManualOrder` -- that a human, not a bot, placed this order. The broker
+              records the order but not who asked for it, and the engine's
+              risk gate never saw it.
+"""
+from datetime import datetime
+
+from sqlalchemy import Column
+from sqlalchemy import DateTime
+from sqlalchemy import Float
+from sqlalchemy import ForeignKey
+from sqlalchemy import Integer
+from sqlalchemy import String
+from sqlalchemy import Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
-from datetime import datetime
+
 from database import Base
 
+
 class User(Base):
-    """
-    User Management: Stores identity and provides relations to financial data.
-    """
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -15,75 +35,121 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
 
-    # Relationships
-    # Added cascade to User->Accounts so deleting a user wipes their data
-    accounts = relationship("Account", back_populates="owner", cascade="all, delete-orphan")
-    transactions = relationship("Transaction", back_populates="owner", cascade="all, delete-orphan")
+    runs = relationship("Run", back_populates="owner",
+                        cascade="all, delete-orphan")
+    manual_orders = relationship("ManualOrder", back_populates="owner",
+                                 cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog", back_populates="user_ref")
-    accounts = relationship("Account", back_populates="owner") # [ADD THIS LINE] Establishes a relationship to count accounts per user
 
-class Account(Base):
+
+class Run(Base):
+    """One engine run, from launch to teardown.
+
+    `session_id` is the engine's own uuid, stamped on every order the bots
+    place, which is how this row can be matched against the broker's fill
+    history afterwards. It is null until the engine logs it, because FinHub
+    starts the process and only then learns what session it chose.
     """
-    Financial Accounts: Separate containers for funds (e.g., Cash, Bank, Savings).
-    Tracks real-time balance for each account.
-    """
-    __tablename__ = "accounts"
+    __tablename__ = "runs"
 
     id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True) # Account Name: e.g., "Cash", "E.SUN Bank"
-    balance = Column(Float, default=0.0)
-    account_type = Column(String)    # e.g., "Checking", "Savings", "Credit Card"
+    session_id = Column(String, index=True, nullable=True)
     owner_id = Column(Integer, ForeignKey("users.id"))
 
-    # Relationship to User
-    owner = relationship("User", back_populates="accounts")
+    # Configuration, exactly as handed to the engine.
+    broker = Column(String, default="arenax")
+    mode = Column(String, default="backtest")       # backtest | paper | demo
+    symbols = Column(String, default="")            # comma separated
+    days = Column(Integer, default=20)
+    fund = Column(Float, default=1_000_000.0)
+    speed = Column(Float, default=1.0)
+    start_date = Column(String, default="")         # "" == let the server pick
+    arenax_port = Column(Integer, default=8802)
+    status_port = Column(Integer, default=8898)
 
-    # [CRITICAL UPDATE] Cascade Delete Logic:
-    # 'cascade="all, delete-orphan"' ensures that when an Account is deleted,
-    # all its child Transaction objects are also purged from the database.
-    transactions = relationship(
-        "Transaction",
-        back_populates="account",
-        cascade="all, delete-orphan"
-    )
+    # starting | running | finished | failed | stopped
+    status = Column(String, default="starting", index=True)
+    exit_code = Column(Integer, nullable=True)
+    error = Column(Text, nullable=True)
+    log_path = Column(String, nullable=True)
 
-class Transaction(Base):
+    started_at = Column(DateTime, default=func.now())
+    ended_at = Column(DateTime, nullable=True)
+
+    # Filled in at teardown from the engine's last reported state, so the runs
+    # list means something without the engine still being alive.
+    bars_served = Column(Integer, nullable=True)
+    final_equity = Column(Float, nullable=True)
+    pnl = Column(Float, nullable=True)
+    fills = Column(Integer, nullable=True)
+    round_trips = Column(Integer, nullable=True)
+    win_rate = Column(Float, nullable=True)
+    halt_reason = Column(String, nullable=True)
+
+    owner = relationship("User", back_populates="runs")
+    bot_slots = relationship("BotSlot", back_populates="run",
+                             cascade="all, delete-orphan")
+
+
+class BotSlot(Base):
+    """Which strategy a bot id was asked to run, for one run.
+
+    The engine reports a bot's live state but not what it was *meant* to be;
+    today it spawns one hardcoded Bot_C. This table is what lets the UI label
+    bots by strategy as soon as the engine takes more than one.
     """
-    Transaction Ledger: The core data model for income and expense records.
-    Fields are encrypted at rest for financial security.
-    """
-    __tablename__ = "transactions"
+    __tablename__ = "bot_slots"
 
     id = Column(Integer, primary_key=True, index=True)
-    description = Column(String)
-    amount = Column(Float)  # Encrypted string
-    category = Column(String)
-    transaction_type = Column(String)
-    date = Column(DateTime, default=func.now())
-    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"))
+    run_id = Column(Integer, ForeignKey("runs.id", ondelete="CASCADE"))
+    bot_id = Column(String, index=True)
+    strategy = Column(String, default="")
+    symbol = Column(String, default="")
+
+    run = relationship("Run", back_populates="bot_slots")
+
+
+class ManualOrder(Base):
+    """An order a human placed from the Trade page.
+
+    Recorded here because neither of the other two systems knows this fact:
+    the broker sees an order like any other, and the engine's RiskGate never
+    sees it at all. Without this row a manual order is indistinguishable from
+    a bot's in the fill history, which makes a run's numbers unexplainable.
+    """
+    __tablename__ = "manual_orders"
+
+    id = Column(Integer, primary_key=True, index=True)
     owner_id = Column(Integer, ForeignKey("users.id"))
+    run_id = Column(Integer, ForeignKey("runs.id", ondelete="SET NULL"),
+                    nullable=True)
 
-    # [DATABASE LEVEL CASCADE]
-    # 'ondelete="CASCADE"' ensures referential integrity at the SQL engine level.
-    account_id = Column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"))
+    order_id = Column(String, index=True)       # the broker's / our uuid
+    symbol = Column(String, index=True)
+    action = Column(String)                     # BUY | SELL
+    quantity = Column(Integer)
+    price = Column(Float)
+    order_lot = Column(String)                  # Common | IntraDayOdd
+    status = Column(String)                     # as the broker answered
+    message = Column(String, default="")
+    created_at = Column(DateTime, default=func.now())
 
-    # Relationships
-    account = relationship("Account", back_populates="transactions")
-    owner = relationship("User", back_populates="transactions")
+    owner = relationship("User", back_populates="manual_orders")
+
 
 class AuditLog(Base):
-    """
-    Audit Trail: Permanent log of sensitive operations (Create/Delete).
-    Critical for financial compliance and accountability.
+    """Permanent trail of the operations that change something.
+
+    Starting a run, stopping a run, placing an order, cancelling everything.
+    Reads are not logged -- a log nobody can read through is not a trail.
     """
     __tablename__ = "audit_logs"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
-    action = Column(String)      # e.g., "CREATE", "DELETE"
-    target_id = Column(Integer)  # ID of the affected entity
-    details = Column(String)     # Human-readable change summary
+    action = Column(String)
+    target = Column(String, default="")
+    details = Column(Text, default="")
     timestamp = Column(DateTime, default=datetime.utcnow)
 
-    # Relationship back to User
     user_ref = relationship("User", back_populates="audit_logs")

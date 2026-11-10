@@ -1,12 +1,13 @@
 # --- [PYTHON CORE] ---
+.venv/
 venv/
 __pycache__/
 *.pyc
 .env
 
 # --- [SECURITY & CONFIG] ---
-# Crucial: Prevent sensitive credentials from being leaked to GitHub
-config.py
+# config.py is tracked: it holds no secrets, only loopback defaults and the
+# names of the env vars that carry them. Secrets live in .env, above.
 *.db
 *.sqlite
 
@@ -17,10 +18,8 @@ config.py
 Thumbs.db
 
 # --- [PROJECT ARTIFACTS & LOGS] ---
+# Captured stdout/stderr of the runs FinHub started.
+run_logs/
 archive/
-*.json
 *.log
-test_evidence.log
-peek_db.py
-test_db.py
-seed_arxiv.py
+.pytest_cache/

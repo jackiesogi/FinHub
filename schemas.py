@@ -1,17 +1,28 @@
-from pydantic import BaseModel, EmailStr
-from typing import List, Optional
-from datetime import datetime
+"""Request and response shapes.
 
-# --- Identity & Access Management (IAM) Schemas ---
+Only the inbound ones are strict. Anything FinHub proxies from the engine or
+the broker is passed through as-is rather than re-modelled: a Pydantic mirror
+of the engine's `/status` would have to be edited every time the engine adds a
+monitor field, and the field would silently vanish from the UI until it was.
+"""
+from datetime import datetime
+from typing import List
+from typing import Optional
+
+from pydantic import BaseModel
+from pydantic import EmailStr
+from pydantic import Field
+
+
+# ── Identity ──────────────────────────────────────────────────────────────────
 
 class UserCreate(BaseModel):
-    """Schema for user registration."""
     username: str
     email: EmailStr
-    password: str
+    password: str = Field(min_length=8)
+
 
 class UserSchema(BaseModel):
-    """Schema for user profile responses."""
     id: int
     username: str
     email: str
@@ -19,78 +30,104 @@ class UserSchema(BaseModel):
     class Config:
         from_attributes = True
 
+
 class Token(BaseModel):
-    """Schema for JWT authentication responses."""
     access_token: str
     token_type: str
 
-# --- Account Management Schemas ---
 
-class AccountBase(BaseModel):
-    """Base definition for financial accounts."""
-    name: str
-    balance: float = 0.0
-    account_type: str = "Checking" # e.g., Savings, Checking, Cash
+# ── Runs ──────────────────────────────────────────────────────────────────────
 
-class AccountCreate(AccountBase):
-    """Schema for creating a new account."""
-    pass
+class RunCreate(BaseModel):
+    """A run request from the New Run form.
 
-class AccountSchema(AccountBase):
-    """Full account schema including database IDs."""
+    Loosely typed on purpose: `RunConfig.parse` does the real validation and
+    bounding, so the rules live in one place rather than being half here and
+    half there. This only keeps obvious nonsense out of the function.
+    """
+    symbols: List[str] = Field(default_factory=list)
+    mode: str = "backtest"
+    days: int = 20
+    fund: float = 1_000_000.0
+    speed: float = 1.0
+    start_date: str = ""
+
+
+class RunSchema(BaseModel):
     id: int
-    owner_id: int
+    session_id: Optional[str] = None
+    broker: str
+    mode: str
+    symbols: str
+    days: int
+    fund: float
+    speed: float
+    start_date: Optional[str] = None
+    status: str
+    exit_code: Optional[int] = None
+    error: Optional[str] = None
+    started_at: Optional[datetime] = None
+    ended_at: Optional[datetime] = None
+    bars_served: Optional[int] = None
+    final_equity: Optional[float] = None
+    pnl: Optional[float] = None
+    fills: Optional[int] = None
+    round_trips: Optional[int] = None
+    win_rate: Optional[float] = None
+    halt_reason: Optional[str] = None
 
     class Config:
         from_attributes = True
 
-# --- Financial Transaction Schemas ---
 
-class TransactionBase(BaseModel):
-    """Base definition for a ledger entry."""
-    description: str
-    amount: float
-    category: str
-    transaction_type: str  # 'income' or 'expense'
-    account_id: int        # [REQUIRED] Links the transaction to a specific account
-    date: Optional[str] = None # Stores the custom date from the frontend
+# ── Manual trading ────────────────────────────────────────────────────────────
 
-class TransactionCreate(TransactionBase):
-    """Schema for creating a new transaction record."""
-    account_id: int
+class OrderCreate(BaseModel):
+    """A manual order.
 
-class TransactionSchema(TransactionBase):
-    """Full transaction record including timestamp and ownership."""
+    `odd_lot` rather than a lot name because that is the only choice the
+    broker's buy/sell path actually offers: it picks IntraDayOdd or Common from
+    this one flag and always sends a limit ROD order. Exposing a free-text lot
+    would imply options that do not exist.
+
+    No price-tick or lot-size rounding is applied, here or anywhere in CJTrade.
+    The price goes to the broker as typed and the broker decides.
+    """
+    symbol: str = Field(min_length=3, max_length=8)
+    action: str = Field(pattern="^(BUY|SELL)$")
+    quantity: int = Field(gt=0, le=10_000_000)
+    price: float = Field(gt=0, le=1_000_000)
+    odd_lot: bool = True
+    confirm: bool = Field(
+        default=False,
+        description="Must be true. A manual order bypasses the engine's risk "
+                    "gate, so it is not something to send by accident.")
+
+
+class ManualOrderSchema(BaseModel):
     id: int
-    date: datetime
-    owner_id: int
+    order_id: str
+    symbol: str
+    action: str
+    quantity: int
+    price: float
+    order_lot: str
+    status: str
+    message: str
+    created_at: datetime
 
     class Config:
         from_attributes = True
 
-# --- Analytics & Reporting Schemas ---
 
-class DashboardSchema(BaseModel):
-    """Schema for high-level financial KPIs."""
-    total_income: float
-    total_expense: float
-    balance: float
+# ── Audit ─────────────────────────────────────────────────────────────────────
 
 class AuditLogSchema(BaseModel):
-    """Schema for security and compliance log records."""
     id: int
     action: str
-    target_id: int
+    target: str
     details: str
     timestamp: datetime
 
     class Config:
         from_attributes = True
-
-class TransferCreate(BaseModel):
-    """Schema for moving funds between two internal accounts."""
-    from_account_id: int
-    to_account_id: int
-    amount: float
-    description: Optional[str] = "Internal Transfer智匯轉帳"
-    date: Optional[str] = None

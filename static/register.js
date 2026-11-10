@@ -49,5 +49,5 @@ document.getElementById('register-form').onsubmit = async (e) => {
 
 // Clear session to avoid conflicts if someone tries to register while logged in
 window.onload = () => {
-    localStorage.removeItem('token');
+    localStorage.removeItem('finhub_token');
 };

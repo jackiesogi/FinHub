@@ -24,7 +24,7 @@ document.getElementById('login-form').onsubmit = async (e) => {
 
         if (resp.ok) {
             // Store token for global authenticated requests
-            localStorage.setItem('token', data.access_token);
+            localStorage.setItem('finhub_token', data.access_token);
             // Redirect to main ledger dashboard
             window.location.href = '/';
         } else {
@@ -44,5 +44,5 @@ document.getElementById('login-form').onsubmit = async (e) => {
  * Clear any stale sessions when visiting the login page.
  */
 window.onload = () => {
-    localStorage.removeItem('token');
+    localStorage.removeItem('finhub_token');
 };
