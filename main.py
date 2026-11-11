@@ -64,9 +64,42 @@ supervisor = RunSupervisor(repo=settings.CJTRADE_REPO, uv_bin=settings.UV_BIN,
 #  Lifespan
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _close_out_orphaned_runs() -> None:
+    """Mark runs that were in flight when FinHub last stopped.
+
+    The supervisor keeps its children in memory, so a FinHub that is killed --
+    a reboot, a crash, a Ctrl-C in the wrong window -- comes back with no idea
+    that run 10 ever existed. `_watch_run` then skips it forever, because it
+    bails on `run_id is None`, and the row sits at "running" describing
+    processes that died with the machine.
+
+    Said as "interrupted" rather than "finished" or "failed": nothing is known
+    about how it ended, and claiming either would be inventing a result.
+    """
+    from database import SessionLocal
+
+    with SessionLocal() as db:
+        stale = (db.query(models.Run)
+                 .filter(models.Run.status.in_(("starting", "running")))
+                 .all())
+        for run in stale:
+            run.status = "interrupted"
+            run.ended_at = run.ended_at or datetime.utcnow()
+            run.error = (run.error or
+                         "FinHub stopped while this run was in flight, so how "
+                         "it ended was never recorded. Its processes did not "
+                         "survive.")
+        if stale:
+            db.commit()
+            log.warning("marked %d run(s) as interrupted: %s", len(stale),
+                        ", ".join(str(r.id) for r in stale))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     models.Base.metadata.create_all(bind=db_engine)
+    # Before the watcher starts, so it never sees a row it cannot explain.
+    _close_out_orphaned_runs()
     log.info("engine status API : %s", settings.engine_base_url)
     log.info("arenax broker     : %s", settings.arenax_base_url)
     log.info("cjtrade checkout  : %s%s", settings.CJTRADE_REPO,
