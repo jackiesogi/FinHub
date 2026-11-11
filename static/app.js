@@ -112,7 +112,7 @@ function emptyRow(tbody, colspan, message) {
 /* ── navigation ───────────────────────────────────────────────────────────── */
 
 const PAGES = ['dashboard', 'runs', 'bots', 'positions', 'orders', 'market',
-               'trade', 'audit'];
+               'trade', 'editor', 'audit'];
 
 function showSection(page, push = true) {
     if (!PAGES.includes(page)) page = 'dashboard';
@@ -134,6 +134,7 @@ function loadSection(page) {
     else if (page === 'orders') { loadOrders(); loadManualOrders(); }
     else if (page === 'market') { loadClock(); }
     else if (page === 'trade') { loadMarketStatus(); }
+    else if (page === 'editor') { loadStrategies(); }
     else if (page === 'audit') { loadAudit(); }
 }
 
@@ -335,17 +336,106 @@ async function loadRoundTrips() {
 const HEADLINE_MONITORS = ['regime', 'volatility', 'signals_emitted',
                            'upper_touches', 'lower_touches', 'mid_crossings'];
 
+/* The bots page lists every bot you have, running or not.
+ *
+ * It used to read /api/v1/engine/bots, which is the engine's live view and
+ * empty between runs — so a strategy somebody had just written was invisible
+ * until a run happened to be in flight. /api/v1/bots answers the question the
+ * page is actually asking by putting the saved strategies and the live report
+ * side by side. The dashboard still shows live bots only, through
+ * renderBotCards below. */
 async function loadBots() {
     let body;
-    try { body = await api('/api/v1/engine/bots'); }
+    try { body = await api('/api/v1/bots'); }
     catch (e) { return; }
     const target = document.getElementById('botCards');
-    if (!body.available) {
-        target.innerHTML = '<p class="text-sm text-slate-400">No run in flight.</p>';
+    const bots = body.bots || [];
+
+    if (!bots.length) {
+        target.innerHTML = '<p class="text-sm text-slate-400">'
+            + 'No bots and no strategies. Write one on the '
+            + '<a href="#" onclick="showSection(\'editor\')" class="underline font-semibold">Strategies</a> page.</p>';
         return;
     }
-    renderBotCards(body.bots || {}, 'botCards');
+
+    const note = document.getElementById('botsEngineNote');
+    if (note) {
+        note.textContent = body.engine_available
+            ? 'A run is in flight; live bots report once per bar.'
+            : `No run in flight${body.reason ? ' — ' + body.reason : ''}. Saved strategies are listed as idle.`;
+    }
+
+    target.innerHTML = bots.map(b => b.live ? liveBotCard(b) : idleBotCard(b))
+                           .join('');
     if (openBotId) loadBotHistory(openBotId);
+}
+
+/* A strategy that exists but is not running. Shown because the page is about
+ * what bots you have, and because the three-state check dot is the only place
+ * that says whether it would even start. */
+function idleBotCard(b) {
+    const dot = b.check_ok === 1
+        ? '<span class="text-emerald-500" title="checked, runnable">●</span>'
+        : b.check_ok === 0
+        ? `<span class="text-red-500" title="${esc(b.check_error || 'has errors')}">●</span>`
+        : '<span class="text-slate-300" title="not checked">●</span>';
+    const verdict = b.check_ok === 1 ? 'Checked and runnable'
+        : b.check_ok === 0 ? (b.check_error || 'Has errors')
+        : 'Not checked yet';
+    return `<div onclick="openStrategyFromBots(${b.strategy_id})"
+         class="bg-white p-5 rounded-2xl border border-dashed border-slate-300 shadow-sm hover:border-slate-400 cursor-pointer transition">
+        <div class="flex justify-between items-start mb-3">
+            <div class="min-w-0">
+                <div class="flex items-center gap-2">${dot}
+                    <span class="font-black text-base truncate">${esc(b.name)}</span></div>
+                <p class="text-[10px] text-slate-400 font-bold uppercase ml-4">${esc(b.symbol)}</p>
+            </div>
+            <span class="text-[10px] font-bold text-slate-400 uppercase shrink-0">Idle</span>
+        </div>
+        <p class="text-[11px] text-slate-500 leading-snug">${esc(verdict)}</p>
+        <p class="text-[10px] text-slate-400 mt-2 border-t border-slate-100 pt-2">
+            Not running. Edited ${esc(shortTime(b.updated_at))}.</p>
+    </div>`;
+}
+
+/* A bot the engine is reporting on. Same shape as the dashboard's card, with
+ * the strategy's name when we know it and the bot id underneath — the id is
+ * what the engine's log and the detail panel are keyed by. */
+function liveBotCard(b) {
+    const s = b.status || {};
+    const mon = s.monitors || {};
+    const inflight = Object.entries(s.inflight || {});
+    const tiles = HEADLINE_MONITORS.filter(k => k in mon).map(k =>
+        `<div><p class="text-[9px] font-bold text-slate-400 uppercase">${esc(k.replace(/_/g, ' '))}</p>
+              <p class="text-sm font-bold tabular-nums">${esc(mon[k])}</p></div>`).join('');
+    const badge = b.kind === 'engine'
+        ? '<span class="text-[10px] font-bold text-slate-400 uppercase">Built in</span>'
+        : '<span class="text-[10px] font-bold text-emerald-600 uppercase">Live</span>';
+    const subtitle = b.kind === 'engine'
+        ? `bar ${int(s.bar_index)}`
+        : `${esc(b.bot_id)} · bar ${int(s.bar_index)}`;
+    return `<div onclick="openBotDetail('${esc(b.bot_id)}')"
+         class="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm hover:border-slate-400 cursor-pointer transition">
+        <div class="flex justify-between items-start mb-3">
+            <div class="min-w-0">
+                <span class="font-black text-base truncate">${esc(b.name)}</span>
+                <p class="text-[10px] text-slate-400 font-bold uppercase">${subtitle}</p>
+            </div>
+            <div class="text-right shrink-0">
+                <p class="text-lg font-black tabular-nums">${num(s.balance, 0)}</p>
+                ${badge}
+            </div>
+        </div>
+        <div class="grid grid-cols-3 gap-2 mb-3">${tiles}</div>
+        ${s.bars_dropped ? `<p class="text-[10px] font-bold text-amber-600 uppercase mb-2">${int(s.bars_dropped)} bar(s) dropped</p>` : ''}
+        ${inflight.length ? `<p class="text-[10px] text-slate-500 mb-2">In flight: ${inflight.map(([k, v]) => `${esc(k)} ${esc(v)}`).join(', ')}</p>` : ''}
+        ${mon.last_decision ? `<p class="text-[11px] text-slate-500 border-t border-slate-100 pt-2 leading-snug">${esc(mon.last_decision)}</p>` : ''}
+    </div>`;
+}
+
+async function openStrategyFromBots(strategyId) {
+    showSection('editor');
+    await openStrategy(strategyId);
 }
 
 function renderBotCards(bots, containerId) {
@@ -902,6 +992,331 @@ function startPolling() {
     }, POLL_MS);
 }
 
+/* ── strategies / editor ──────────────────────────────────────────────────────
+ *
+ * The editor itself is static/vendor/codemirror.bundle.js, which exposes
+ * window.FinHubEditor and nothing else (see tools/editor/README.md). It is
+ * created on first use rather than at boot, because most visits never open
+ * this page and a 460 KB editor should not be mounted for them.
+ *
+ * Checking costs about a second — it is a subprocess in the CJTrade checkout,
+ * most of which is importing TA-Lib — so it runs on save, on demand, and after
+ * a long idle pause. Not per keystroke. */
+
+const CHECK_IDLE_MS = 1200;
+
+let editorView = null;
+let editorStrategy = null;      // the row being edited, or null
+let editorClean = '';           // the source as last saved
+let checkTimer = null;
+
+function editorIsDirty() {
+    return !!(editorView && editorStrategy
+              && FinHubEditor.getValue(editorView) !== editorClean);
+}
+
+async function ensureEditor() {
+    if (editorView) return editorView;
+    if (!window.FinHubEditor) {
+        toast('The code editor failed to load. Reload the page.', 'error');
+        return null;
+    }
+    editorView = FinHubEditor.create(
+        document.getElementById('editorHost'), '', onEditorChanged);
+    /* Completion over the strategy API. Best effort: without it CodeMirror
+     * still completes Python keywords and the user's own names, so a failure
+     * here must not stop the editor opening. */
+    try {
+        const ref = await api('/api/v1/strategies/api-reference');
+        FinHubEditor.setApi(ref.entries || []);
+        if (ref.error) {
+            toast('Completion for the strategy API is unavailable: '
+                  + ref.error, 'error');
+        }
+    } catch (e) {
+        toast('Could not load the strategy API reference: ' + e.message,
+              'error');
+    }
+    return editorView;
+}
+
+function onEditorChanged() {
+    const dirty = editorIsDirty();
+    document.getElementById('editorDirty').classList.toggle('hidden', !dirty);
+    if (!dirty) return;
+    /* A stored verdict described the stored text, so it stops applying the
+     * moment the text changes. */
+    setEditorStatus('Edited. Not checked yet.', 'idle');
+    clearTimeout(checkTimer);
+    checkTimer = setTimeout(() => checkStrategy(true), CHECK_IDLE_MS);
+}
+
+function setEditorStatus(message, kind) {
+    const el = document.getElementById('editorStatus');
+    el.textContent = message;
+    el.className = 'text-xs ' + (
+        kind === 'ok' ? 'text-emerald-600 font-semibold'
+        : kind === 'error' ? 'text-red-600 font-semibold'
+        : kind === 'busy' ? 'text-slate-500'
+        : 'text-slate-400');
+}
+
+function setEditorButtons(enabled) {
+    ['editorSaveBtn', 'editorCheckBtn', 'editorDeleteBtn'].forEach(
+        id => document.getElementById(id).disabled = !enabled);
+}
+
+async function loadStrategies(selectId) {
+    const host = document.getElementById('strategyList');
+    let rows;
+    try {
+        rows = await api('/api/v1/strategies');
+    } catch (e) {
+        host.innerHTML = `<p class="px-4 py-6 text-xs text-red-600">${esc(e.message)}</p>`;
+        return;
+    }
+    if (!rows.length) {
+        host.innerHTML = '<p class="px-4 py-6 text-xs text-slate-400">'
+            + 'Nothing yet. Press <b>+ New Strategy</b>.</p>';
+        return;
+    }
+    host.innerHTML = rows.map(s => {
+        /* Three states, not two: never checked is not the same as checked and
+         * broken, and a tick on unchecked text would be a lie. */
+        const mark = s.last_check_ok === 1
+            ? '<span class="text-emerald-500" title="checked, runnable">●</span>'
+            : s.last_check_ok === 0
+            ? `<span class="text-red-500" title="${esc(s.last_check_error || 'has errors')}">●</span>`
+            : '<span class="text-slate-300" title="not checked">●</span>';
+        const active = editorStrategy && editorStrategy.id === s.id;
+        return `<button onclick="openStrategy(${s.id})"
+            class="w-full text-left px-4 py-3 hover:bg-slate-50 transition ${active ? 'bg-slate-50' : ''}">
+            <div class="flex items-center gap-2">${mark}
+                <span class="font-bold text-sm truncate">${esc(s.name)}</span></div>
+            <div class="text-[11px] text-slate-400 mt-0.5 ml-4">${esc(s.symbol)}
+                · ${esc(shortTime(s.updated_at))}</div>
+        </button>`;
+    }).join('');
+    if (selectId) await openStrategy(selectId);
+}
+
+async function openStrategy(id) {
+    if (editorIsDirty() && !confirm(
+            'This strategy has unsaved changes. Discard them?')) {
+        return;
+    }
+    const view = await ensureEditor();
+    if (!view) return;
+    let s;
+    try {
+        s = await api(`/api/v1/strategies/${id}`);
+    } catch (e) {
+        toast(e.message, 'error');
+        return;
+    }
+    editorStrategy = s;
+    editorClean = s.source;
+    FinHubEditor.setValue(view, s.source);
+    FinHubEditor.showDiagnostics(view, []);
+    document.getElementById('editorTitle').textContent = s.name;
+    document.getElementById('editorSubtitle').textContent =
+        `${s.symbol} · strategy #${s.id}`;
+    document.getElementById('editorDirty').classList.add('hidden');
+    document.getElementById('editorParams').classList.add('hidden');
+    document.getElementById('editorDiagnostics').classList.add('hidden');
+    setEditorButtons(true);
+    setEditorStatus(
+        s.last_check_ok === 1 ? 'Checked and runnable.'
+        : s.last_check_ok === 0 ? (s.last_check_error || 'Has errors.')
+        : 'Not checked yet.',
+        s.last_check_ok === 1 ? 'ok' : s.last_check_ok === 0 ? 'error' : 'idle');
+    loadStrategies();            // repaint the list so the active row shows
+}
+
+async function checkStrategy(quiet) {
+    if (!editorView || !editorStrategy) return;
+    clearTimeout(checkTimer);
+    setEditorStatus('Checking…', 'busy');
+    let result;
+    try {
+        result = await api('/api/v1/strategies/check', {
+            method: 'POST',
+            body: JSON.stringify({source: FinHubEditor.getValue(editorView)}),
+        });
+    } catch (e) {
+        setEditorStatus(e.message, 'error');
+        if (!quiet) toast(e.message, 'error');
+        return;
+    }
+    renderCheck(result);
+    return result;
+}
+
+function renderCheck(result) {
+    const diags = result.diagnostics || [];
+    FinHubEditor.showDiagnostics(editorView, diags);
+
+    const panel = document.getElementById('editorDiagnostics');
+    panel.classList.toggle('hidden', diags.length === 0);
+    panel.innerHTML = diags.map(d => `
+        <div class="text-xs flex gap-2 ${d.severity === 'warning' ? 'text-amber-700' : 'text-red-600'}">
+            <button onclick="gotoLine(${d.line})"
+                class="font-mono font-bold shrink-0 hover:underline">L${d.line}</button>
+            <span>${esc(d.message)}</span>
+        </div>`).join('');
+
+    const params = result.params || [];
+    const paramBox = document.getElementById('editorParams');
+    paramBox.classList.toggle('hidden', params.length === 0);
+    document.getElementById('editorParamList').innerHTML = params.map(p => {
+        const lo = p.min === undefined || p.min === null ? '—' : p.min;
+        const hi = p.max === undefined || p.max === null ? '—' : p.max;
+        const bounds = (p.min !== undefined || p.max !== undefined)
+            ? ` <span class="text-slate-400">(${esc(lo)} … ${esc(hi)})</span>` : '';
+        return `<div class="text-xs bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
+            <div class="font-semibold">${esc(p.label)}</div>
+            <div class="text-slate-500 tabular-nums">${esc(String(p.default))}
+                <span class="text-slate-300">${esc(p.kind)}</span>${bounds}</div>
+        </div>`;
+    }).join('');
+
+    if (result.ok) {
+        setEditorStatus(params.length
+            ? `No problems. ${params.length} parameter(s) declared.`
+            : 'No problems.', 'ok');
+    } else {
+        const n = diags.filter(d => d.severity !== 'warning').length;
+        setEditorStatus(`${n} problem${n === 1 ? '' : 's'} — this will not run.`,
+                        'error');
+    }
+}
+
+function gotoLine(line) {
+    if (!editorView) return;
+    const doc = editorView.state.doc;
+    const at = doc.line(Math.max(1, Math.min(doc.lines, line)));
+    editorView.dispatch({selection: {anchor: at.from}, scrollIntoView: true});
+    editorView.focus();
+}
+
+async function saveStrategy() {
+    if (!editorView || !editorStrategy) return;
+    const source = FinHubEditor.getValue(editorView);
+    const btn = document.getElementById('editorSaveBtn');
+    btn.disabled = true;
+    try {
+        await api(`/api/v1/strategies/${editorStrategy.id}`, {
+            method: 'PUT', body: JSON.stringify({source}),
+        });
+        editorClean = source;
+        document.getElementById('editorDirty').classList.add('hidden');
+        toast('Saved');
+        /* Check the saved text and record the verdict, so the dot in the list
+         * means something without anyone pressing Check. */
+        renderCheck(await api(
+            `/api/v1/strategies/${editorStrategy.id}/check`, {method: 'POST'}));
+        loadStrategies();
+        loadBots();              // the check dot on its bot card just changed
+    } catch (e) {
+        toast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+function closeEditor() {
+    editorStrategy = null;
+    editorClean = '';
+    if (editorView) {
+        FinHubEditor.setValue(editorView, '');
+        FinHubEditor.showDiagnostics(editorView, []);
+    }
+    document.getElementById('editorTitle').textContent = 'No strategy open';
+    document.getElementById('editorSubtitle').textContent =
+        'Pick one on the left, or make a new one';
+    document.getElementById('editorDirty').classList.add('hidden');
+    document.getElementById('editorParams').classList.add('hidden');
+    document.getElementById('editorDiagnostics').classList.add('hidden');
+    setEditorButtons(false);
+    setEditorStatus('Nothing checked yet.', 'idle');
+}
+
+async function deleteStrategy() {
+    if (!editorStrategy) return;
+    if (!confirm(`Delete "${editorStrategy.name}"? This cannot be undone.`)) {
+        return;
+    }
+    try {
+        await api(`/api/v1/strategies/${editorStrategy.id}`, {method: 'DELETE'});
+    } catch (e) {
+        toast(e.message, 'error');
+        return;
+    }
+    toast('Deleted');
+    closeEditor();
+    loadStrategies();
+    /* The bots page lists strategies, so it is now showing one that no longer
+     * exists. Repainted here rather than left to the poll, because the poll
+     * only runs while that page is the open one. */
+    loadBots();
+}
+
+/* The nearly-blank option. Kept here rather than in CJTrade because it
+ * demonstrates nothing about the API — the starter template is the thing that
+ * teaches, and that one is generated from the authoring module itself. */
+const BLANK_STRATEGY = `"""%NAME% — %SYMBOL%"""
+from cjtrade.pkgs.strategy.authoring import *
+
+
+def on_bar(bar, account):
+    watch(price=bar.close)
+    return hold("nothing decided yet")
+`;
+
+function openStrategyModal() {
+    document.getElementById('strategyFormError').textContent = '';
+    document.getElementById('strategyModal').classList.add('active');
+    document.getElementById('strategyName').focus();
+}
+
+function closeStrategyModal() {
+    document.getElementById('strategyModal').classList.remove('active');
+}
+
+async function submitStrategy(event) {
+    event.preventDefault();
+    const btn = document.getElementById('strategySubmit');
+    const error = document.getElementById('strategyFormError');
+    const name = document.getElementById('strategyName').value.trim();
+    const symbol = document.getElementById('strategySymbol').value.trim();
+    const kind = document.getElementById('strategyTemplate').value;
+
+    error.textContent = '';
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    try {
+        const body = {name, symbol};
+        if (kind === 'blank') {
+            body.source = BLANK_STRATEGY
+                .replace('%NAME%', name).replace('%SYMBOL%', symbol);
+        }
+        /* source omitted for 'starter': the server fills it in from CJTrade's
+         * own template, which is generated next to the API it demonstrates. */
+        const created = await api('/api/v1/strategies', {
+            method: 'POST', body: JSON.stringify(body),
+        });
+        closeStrategyModal();
+        await loadStrategies(created.id);
+        loadBots();              // it belongs on that page from now on
+        toast(`Created "${created.name}"`);
+    } catch (e) {
+        error.textContent = e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Create';
+    }
+}
+
 /* ── boot ─────────────────────────────────────────────────────────────────── */
 
 window.addEventListener('popstate', () => showSection(currentPage(), false));
@@ -916,6 +1331,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     document.getElementById('runForm').addEventListener('submit', submitRun);
     document.getElementById('orderForm').addEventListener('submit', submitOrder);
+    document.getElementById('strategyForm').addEventListener('submit', submitStrategy);
 
     // Default the kbars range to the last 30 days.
     const today = new Date();

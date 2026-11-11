@@ -21,6 +21,7 @@ import main  # noqa: E402
 from cjtrade import BrokerError  # noqa: E402
 from cjtrade import EngineUnavailable  # noqa: E402
 from cjtrade import RunConfig  # noqa: E402
+from cjtrade import StrategyToolError  # noqa: E402
 from cjtrade import SupervisorError  # noqa: E402
 from cjtrade import arenax_client  # noqa: E402
 from database import Base  # noqa: E402
@@ -77,9 +78,16 @@ PROTECTED = [
     ("get", "/api/v1/runs"),
     ("get", "/api/v1/supervisor"),
     ("get", "/api/v1/audit"),
+    ("get", "/api/v1/strategies"),
+    ("get", "/api/v1/strategies/api-reference"),
     ("post", "/api/v1/runs"),
     ("post", "/api/v1/broker/orders"),
     ("post", "/api/v1/broker/orders/cancel-all"),
+    # Writing a strategy is writing Python this host will execute. FinHub is a
+    # single trust domain, so an account is permission to do that -- but not
+    # having an account must not be.
+    ("post", "/api/v1/strategies"),
+    ("post", "/api/v1/strategies/check"),
 ]
 
 
@@ -398,3 +406,412 @@ def test_an_unknown_page_is_a_404_not_a_blank_dashboard(client):
     page rather than a bad URL."""
     res = client.get("/not-a-page")
     assert res.status_code == 404
+
+
+# ── strategies ───────────────────────────────────────────────────────────────
+#
+# The checker is a subprocess in the CJTrade checkout, so it is faked here:
+# these tests are about the routes, ownership and what gets stored, and a test
+# suite that shells out to another repository would fail for reasons that have
+# nothing to do with FinHub. That the checker itself works is CJTrade's to
+# prove (tests/unit/pkgs/strategy/).
+
+TEMPLATE = ('"""%s — %s"""\n'
+            'from cjtrade.pkgs.strategy.authoring import *\n\n\n'
+            'def on_bar(bar, account):\n    return hold("stub")\n')
+
+
+@pytest.fixture
+def fake_checker(monkeypatch):
+    """Stand in for the CJTrade subprocess, and record what it was asked."""
+    calls = {"template": [], "check": [], "api": 0}
+
+    def template(name, symbol):
+        calls["template"].append((name, symbol))
+        return TEMPLATE % (name, symbol)
+
+    def check(source):
+        calls["check"].append(source)
+        if "def on_bar(bar, account)" in source:
+            return {"ok": True, "diagnostics": [],
+                    "params": [{"kind": "int", "default": 20,
+                                "label": "Window", "min": 2}]}
+        return {"ok": False, "params": [], "diagnostics": [
+            {"message": "a strategy needs a function called on_bar(bar, account)",
+             "line": 1, "offset": 1, "severity": "error"}]}
+
+    def api_reference():
+        calls["api"] += 1
+        return [{"name": "buy", "qualified": "buy", "kind": "function",
+                 "signature": "buy(shares=None)", "doc": "Ask to buy."}]
+
+    monkeypatch.setattr(main.strategy_tool, "template", template)
+    monkeypatch.setattr(main.strategy_tool, "check", check)
+    monkeypatch.setattr(main.strategy_tool, "api_reference", api_reference)
+    return calls
+
+
+def _new_strategy(client, authed, **kwargs):
+    body = {"name": "Fade the band", "symbol": "2330"}
+    body.update(kwargs)
+    res = client.post("/api/v1/strategies", json=body, headers=authed)
+    assert res.status_code == 201, res.text
+    return res.json()
+
+
+def test_a_new_strategy_is_prefilled_with_the_name_and_symbol(
+        client, authed, fake_checker):
+    """A blank editor is the worst place to learn an API from, so the server
+    fills one in -- and the template comes from CJTrade, not from FinHub."""
+    created = _new_strategy(client, authed)
+    assert created["name"] == "Fade the band"
+    assert created["symbol"] == "2330"
+    assert "Fade the band — 2330" in created["source"]
+    assert fake_checker["template"] == [("Fade the band", "2330")]
+
+
+def test_a_supplied_source_is_not_overwritten(client, authed, fake_checker):
+    created = _new_strategy(client, authed, source="# mine\n")
+    assert created["source"] == "# mine\n"
+    assert fake_checker["template"] == []
+
+
+def test_a_new_strategy_has_no_verdict_yet(client, authed, fake_checker):
+    """Three states, not two: never checked is not the same as checked and
+    broken, and a tick on unchecked text would be a lie."""
+    assert _new_strategy(client, authed)["last_check_ok"] is None
+
+
+def test_symbols_are_normalised(client, authed, fake_checker):
+    assert _new_strategy(client, authed, symbol=" 0050 ")["symbol"] == "0050"
+
+
+@pytest.mark.parametrize("symbol", ["", "2317 2330", "../etc/passwd",
+                                    "2317;rm", "a" * 13])
+def test_a_symbol_that_is_not_a_symbol_is_refused(client, authed, fake_checker,
+                                                  symbol):
+    res = client.post("/api/v1/strategies",
+                      json={"name": "x", "symbol": symbol}, headers=authed)
+    assert res.status_code == 422, f"{symbol!r} was accepted"
+
+
+def test_checking_stores_the_verdict_so_the_list_can_show_it(
+        client, authed, fake_checker):
+    created = _new_strategy(client, authed)
+    res = client.post(f"/api/v1/strategies/{created['id']}/check",
+                      headers=authed)
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is True
+    assert res.json()["params"][0]["label"] == "Window"
+
+    listed = client.get("/api/v1/strategies", headers=authed).json()
+    row = next(s for s in listed if s["id"] == created["id"])
+    assert row["last_check_ok"] == 1
+    assert row["last_check_error"] is None
+    assert "source" not in row         # the list is not twenty files
+
+
+def test_a_broken_strategy_records_the_first_problem(client, authed,
+                                                     fake_checker):
+    created = _new_strategy(client, authed, source="x = 1\n")
+    res = client.post(f"/api/v1/strategies/{created['id']}/check",
+                      headers=authed)
+    assert res.json()["ok"] is False
+    stored = client.get(f"/api/v1/strategies/{created['id']}",
+                        headers=authed).json()
+    assert stored["last_check_ok"] == 0
+    assert "on_bar" in stored["last_check_error"]
+
+
+def test_a_source_full_of_errors_is_still_a_200(client, authed, fake_checker):
+    """"This does not compile" is a successful answer to the question asked,
+    and the editor needs the diagnostics in the body either way."""
+    res = client.post("/api/v1/strategies/check", json={"source": "x = 1\n"},
+                      headers=authed)
+    assert res.status_code == 200, res.text
+    assert res.json()["ok"] is False
+    assert res.json()["diagnostics"][0]["line"] == 1
+
+
+def test_a_checker_that_cannot_run_is_a_502(client, authed, monkeypatch):
+    """Distinct from a broken strategy. One is the user's problem, the other
+    is the deployment's, and the editor says different things about them."""
+    def explode(_source):
+        raise StrategyToolError("cannot run 'uv' — is uv on FinHub's PATH?")
+    monkeypatch.setattr(main.strategy_tool, "check", explode)
+    res = client.post("/api/v1/strategies/check", json={"source": "x = 1\n"},
+                      headers=authed)
+    assert res.status_code == 502
+    assert "uv" in res.json()["detail"]
+
+
+def test_editing_the_source_clears_a_stale_verdict(client, authed,
+                                                   fake_checker):
+    created = _new_strategy(client, authed)
+    client.post(f"/api/v1/strategies/{created['id']}/check", headers=authed)
+    res = client.put(f"/api/v1/strategies/{created['id']}",
+                     json={"source": "# changed\n"}, headers=authed)
+    assert res.status_code == 200, res.text
+    assert res.json()["last_check_ok"] is None
+    assert res.json()["last_check_error"] is None
+
+
+def test_renaming_does_not_clear_the_verdict(client, authed, fake_checker):
+    """The verdict is about the source, and a rename does not touch it."""
+    created = _new_strategy(client, authed)
+    client.post(f"/api/v1/strategies/{created['id']}/check", headers=authed)
+    res = client.put(f"/api/v1/strategies/{created['id']}",
+                     json={"name": "Renamed"}, headers=authed)
+    assert res.json()["name"] == "Renamed"
+    assert res.json()["last_check_ok"] == 1
+
+
+def test_saving_the_same_source_leaves_the_verdict_alone(client, authed,
+                                                         fake_checker):
+    created = _new_strategy(client, authed)
+    client.post(f"/api/v1/strategies/{created['id']}/check", headers=authed)
+    res = client.put(f"/api/v1/strategies/{created['id']}",
+                     json={"source": created["source"]}, headers=authed)
+    assert res.json()["last_check_ok"] == 1
+
+
+def test_another_users_strategy_is_a_404_not_a_403(client, fake_checker):
+    """A 403 would confirm that the strategy exists and belongs to someone
+    else, which this endpoint has no reason to tell anyone."""
+    def account():
+        name = f"owner_{uuid.uuid4().hex[:8]}"
+        client.post("/api/v1/auth/register", json={
+            "username": name, "email": f"{name}@example.com",
+            "password": "a-long-enough-password"})
+        token = client.post("/api/v1/auth/login", data={
+            "username": name, "password": "a-long-enough-password"
+        }).json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    mine, theirs = account(), account()
+    created = _new_strategy(client, mine)
+
+    for call in (lambda: client.get(f"/api/v1/strategies/{created['id']}",
+                                    headers=theirs),
+                 lambda: client.put(f"/api/v1/strategies/{created['id']}",
+                                    json={"name": "stolen"}, headers=theirs),
+                 lambda: client.delete(f"/api/v1/strategies/{created['id']}",
+                                       headers=theirs),
+                 lambda: client.post(f"/api/v1/strategies/{created['id']}/check",
+                                     headers=theirs)):
+        res = call()
+        assert res.status_code == 404, res.text
+
+    # And it is untouched.
+    still = client.get(f"/api/v1/strategies/{created['id']}",
+                       headers=mine).json()
+    assert still["name"] == "Fade the band"
+    assert [s["id"] for s in client.get("/api/v1/strategies",
+                                        headers=theirs).json()] == []
+
+
+def test_deleting_removes_it(client, authed, fake_checker):
+    created = _new_strategy(client, authed)
+    assert client.delete(f"/api/v1/strategies/{created['id']}",
+                         headers=authed).status_code == 204
+    assert client.get(f"/api/v1/strategies/{created['id']}",
+                      headers=authed).status_code == 404
+
+
+def test_api_reference_is_not_shadowed_by_the_id_route(client, authed,
+                                                       fake_checker):
+    """`/strategies/api-reference` must not be read as strategy id
+    "api-reference"; it is declared first for exactly that reason."""
+    res = client.get("/api/v1/strategies/api-reference", headers=authed)
+    assert res.status_code == 200, res.text
+    assert res.json()["entries"][0]["name"] == "buy"
+    assert fake_checker["api"] == 1
+
+
+def test_a_missing_api_reference_does_not_break_the_editor(client, authed,
+                                                           monkeypatch):
+    """The editor still has CodeMirror's own Python completion without it, so
+    this is an empty list with a reason rather than a 500."""
+    def explode():
+        raise StrategyToolError("the strategy checker failed")
+    monkeypatch.setattr(main.strategy_tool, "api_reference", explode)
+    res = client.get("/api/v1/strategies/api-reference", headers=authed)
+    assert res.status_code == 200
+    assert res.json()["entries"] == []
+    assert "checker" in res.json()["error"]
+
+
+def test_an_oversized_source_is_refused_before_it_reaches_a_subprocess(
+        client, authed):
+    res = client.post("/api/v1/strategies/check",
+                      json={"source": "#" * 300_000}, headers=authed)
+    assert res.status_code == 422
+
+
+def test_the_editor_page_serves_the_shell(client):
+    assert client.get("/editor").status_code == 200
+
+
+# ── the bots page ────────────────────────────────────────────────────────────
+#
+# /api/v1/engine/bots is the engine's live view and empty between runs, so a
+# strategy somebody had just written was invisible until a run happened to be
+# in flight. /api/v1/bots is the composed answer: what bots exist, and which
+# of them are alive.
+
+
+def _fake_live(monkeypatch, bots):
+    async def live():
+        return bots
+    monkeypatch.setattr(main.engine_client, "bots", live)
+
+
+def _no_engine(monkeypatch):
+    async def live():
+        raise EngineUnavailable("no run in flight")
+    monkeypatch.setattr(main.engine_client, "bots", live)
+
+
+def test_a_saved_strategy_appears_with_no_run_in_flight(client, authed,
+                                                        fake_checker,
+                                                        monkeypatch):
+    _no_engine(monkeypatch)
+    created = _new_strategy(client, authed, name="Idle one", symbol="2454")
+    body = client.get("/api/v1/bots", headers=authed).json()
+
+    assert body["engine_available"] is False
+    entry = next(b for b in body["bots"] if b["strategy_id"] == created["id"])
+    assert (entry["kind"], entry["name"], entry["symbol"]) == (
+        "strategy", "Idle one", "2454")
+    assert entry["live"] is False
+    assert entry["bot_id"] is None
+    assert entry["status"] is None
+
+
+def test_the_check_state_rides_along_so_the_card_can_show_it(
+        client, authed, fake_checker, monkeypatch):
+    _no_engine(monkeypatch)
+    created = _new_strategy(client, authed)
+    before = _bot_entry(client, authed, created["id"])
+    assert before["check_ok"] is None          # never checked
+
+    client.post(f"/api/v1/strategies/{created['id']}/check", headers=authed)
+    after = _bot_entry(client, authed, created["id"])
+    assert after["check_ok"] == 1
+    assert after["check_error"] is None
+
+
+def _bot_entry(client, authed, strategy_id):
+    body = client.get("/api/v1/bots", headers=authed).json()
+    return next(b for b in body["bots"] if b["strategy_id"] == strategy_id)
+
+
+def test_deleting_the_strategy_removes_it_from_the_bots_page(
+        client, authed, fake_checker, monkeypatch):
+    _no_engine(monkeypatch)
+    created = _new_strategy(client, authed, name="Short lived")
+    assert _bot_entry(client, authed, created["id"])["name"] == "Short lived"
+
+    assert client.delete(f"/api/v1/strategies/{created['id']}",
+                         headers=authed).status_code == 204
+    body = client.get("/api/v1/bots", headers=authed).json()
+    assert all(b["strategy_id"] != created["id"] for b in body["bots"])
+    assert all(b["name"] != "Short lived" for b in body["bots"])
+
+
+def test_a_live_bot_with_no_strategy_of_yours_is_still_listed(
+        client, authed, monkeypatch):
+    """The engine ships built-in bots, and a bot that is trading must never be
+    missing from the page that shows bots."""
+    _fake_live(monkeypatch, {"Bot_C": {"bar_index": 42, "balance": 99_000.0,
+                                       "monitors": {"regime": "tradeable"}}})
+    body = client.get("/api/v1/bots", headers=authed).json()
+    entry = next(b for b in body["bots"] if b["bot_id"] == "Bot_C")
+    assert entry["kind"] == "engine"
+    assert entry["live"] is True
+    assert entry["status"]["bar_index"] == 42
+    assert entry["strategy_id"] is None
+
+
+def test_a_live_bot_is_matched_to_the_strategy_it_is_running(
+        client, authed, fake_checker, monkeypatch):
+    created = _new_strategy(client, authed, name="Running one", symbol="2317")
+    bot_id = f"Bot_{uuid.uuid4().hex[:6]}"
+    _run_with_slot(client, authed, bot_id=bot_id, strategy_id=created["id"],
+                   strategy="Running one", symbol="2317")
+    _fake_live(monkeypatch, {bot_id: {"bar_index": 7, "balance": 1.0,
+                                      "monitors": {}}})
+
+    body = client.get("/api/v1/bots", headers=authed).json()
+    entry = next(b for b in body["bots"] if b["strategy_id"] == created["id"])
+    assert entry["live"] is True
+    assert entry["bot_id"] == bot_id
+    assert entry["status"]["bar_index"] == 7
+    # And it is not listed twice, once as a strategy and once as an engine bot.
+    assert sum(1 for b in body["bots"] if b["bot_id"] == bot_id) == 1
+
+
+def test_deleting_a_strategy_keeps_the_record_of_the_run_that_used_it(
+        client, authed, fake_checker, monkeypatch):
+    """Off the bots page, but not erased: the slot is the record that a run
+    happened, so it has to outlive the source it ran."""
+    created = _new_strategy(client, authed, name="Was run once")
+    bot_id = f"Bot_{uuid.uuid4().hex[:6]}"
+    run_id = _run_with_slot(client, authed, bot_id=bot_id,
+                            strategy_id=created["id"],
+                            strategy="Was run once", symbol="2317")
+    client.delete(f"/api/v1/strategies/{created['id']}", headers=authed)
+
+    with _Session() as db:
+        slot = db.query(main.models.BotSlot).filter(
+            main.models.BotSlot.run_id == run_id).one()
+        assert slot.strategy_id is None          # de-associated, not deleted
+        assert slot.strategy == "Was run once"   # still readable
+
+    # And a live bot on that id is labelled by the name recorded at launch.
+    _fake_live(monkeypatch, {bot_id: {"bar_index": 1, "balance": 1.0,
+                                      "monitors": {}}})
+    body = client.get("/api/v1/bots", headers=authed).json()
+    entry = next(b for b in body["bots"] if b["bot_id"] == bot_id)
+    assert entry["kind"] == "engine"
+    assert entry["name"] == "Was run once"
+
+
+def test_one_users_strategies_are_not_on_another_users_bots_page(
+        client, fake_checker, monkeypatch):
+    _no_engine(monkeypatch)
+
+    def account():
+        name = f"botpage_{uuid.uuid4().hex[:8]}"
+        client.post("/api/v1/auth/register", json={
+            "username": name, "email": f"{name}@example.com",
+            "password": "a-long-enough-password"})
+        token = client.post("/api/v1/auth/login", data={
+            "username": name, "password": "a-long-enough-password"
+        }).json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    mine, theirs = account(), account()
+    created = _new_strategy(client, mine, name="Only mine")
+    body = client.get("/api/v1/bots", headers=theirs).json()
+    assert all(b["strategy_id"] != created["id"] for b in body["bots"])
+
+
+def _run_with_slot(client, authed, *, bot_id, strategy_id, strategy, symbol):
+    """A finished run with one bot slot, written straight to the DB.
+
+    Going through POST /runs would spawn processes; what is being tested here
+    is the join between a slot and a strategy, which does not need a run to
+    have actually happened.
+    """
+    me = client.get("/api/v1/auth/me", headers=authed).json()
+    with _Session() as db:
+        run = main.models.Run(owner_id=me["id"], status="finished",
+                         symbols=symbol, mode="backtest")
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        db.add(main.models.BotSlot(run_id=run.id, bot_id=bot_id, strategy=strategy,
+                              symbol=symbol, strategy_id=strategy_id))
+        db.commit()
+        return run.id

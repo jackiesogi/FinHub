@@ -55,6 +55,7 @@
             <a href="#" onclick="showSection('orders')"    id="nav-orders"    class="nav-link"><span>📋</span><span>Orders</span></a>
             <a href="#" onclick="showSection('market')"    id="nav-market"    class="nav-link"><span>📈</span><span>Market</span></a>
             <a href="#" onclick="showSection('trade')"     id="nav-trade"     class="nav-link"><span>✋</span><span>Manual Trade</span></a>
+            <a href="#" onclick="showSection('editor')"    id="nav-editor"    class="nav-link"><span>✎</span><span>Strategies</span></a>
             <a href="#" onclick="showSection('audit')"     id="nav-audit"     class="nav-link"><span>🛡️</span><span>Audit</span></a>
         </nav>
 
@@ -193,7 +194,11 @@
         <div id="section-bots" class="page hidden px-4 md:px-6 lg:px-8 py-6 md:py-8 space-y-6">
             <section class="bg-white px-4 md:px-6 py-4 rounded-2xl border border-slate-200">
                 <h2 class="text-lg md:text-2xl font-bold">Bots</h2>
-                <p class="text-xs text-slate-500 mt-1">Each bot reports once per bar over the engine's own socket. Click a card for its history.</p>
+                <!-- Every bot you have, not only the running ones: a strategy
+                     that has just been written was invisible here until a run
+                     happened to be in flight. -->
+                <p class="text-xs text-slate-500 mt-1">Every strategy you have saved, plus whatever the engine is running. A live bot reports once per bar; click its card for the history.</p>
+                <p class="text-xs text-slate-400 mt-1" id="botsEngineNote">—</p>
             </section>
             <div id="botCards" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4"></div>
             <section id="botDetail" class="hidden bg-white p-4 md:p-6 rounded-2xl border border-slate-200 shadow-sm space-y-5">
@@ -403,6 +408,59 @@
         </div>
 
         <!-- ─── Audit ─── -->
+        <!-- ══ Strategies / editor ══ -->
+        <div id="section-editor" class="page hidden px-4 md:px-6 lg:px-8 py-6 md:py-8 space-y-6">
+            <section class="bg-white px-4 md:px-6 py-4 rounded-2xl border border-slate-200 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+                <div>
+                    <h2 class="text-lg md:text-2xl font-bold">Strategies</h2>
+                    <!-- Said once, here, rather than left to be discovered: a
+                         strategy is Python that runs on this host. -->
+                    <p class="text-xs text-slate-500 mt-1">A strategy is Python that runs on this machine, inside the engine's risk gate. Only you can see yours.</p>
+                </div>
+                <button onclick="openStrategyModal()" class="px-4 md:px-6 py-2.5 text-sm font-bold text-white bg-slate-900 rounded-lg shadow-md hover:bg-slate-800 transition w-full sm:w-auto">+ New Strategy</button>
+            </section>
+
+            <div class="grid grid-cols-1 lg:grid-cols-[18rem_1fr] gap-4 md:gap-6">
+                <!-- the list -->
+                <section class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden self-start">
+                    <h3 class="text-[10px] font-bold text-slate-400 uppercase px-4 pt-4 pb-2">Your strategies</h3>
+                    <div id="strategyList" class="divide-y divide-slate-100 max-h-[70vh] overflow-y-auto">
+                        <p class="px-4 py-6 text-xs text-slate-400">Loading…</p>
+                    </div>
+                </section>
+
+                <!-- the editor -->
+                <section class="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden flex flex-col">
+                    <div class="px-4 md:px-5 py-3 border-b border-slate-100 flex flex-wrap items-center gap-3">
+                        <div class="flex-grow min-w-0">
+                            <div class="font-bold text-sm truncate" id="editorTitle">No strategy open</div>
+                            <div class="text-[11px] text-slate-400" id="editorSubtitle">Pick one on the left, or make a new one</div>
+                        </div>
+                        <span id="editorDirty" class="hidden text-[10px] font-bold uppercase tracking-widest text-amber-600">Unsaved</span>
+                        <button id="editorCheckBtn" onclick="checkStrategy()" disabled class="px-3 py-2 text-xs font-bold text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition disabled:opacity-40">Check</button>
+                        <button id="editorSaveBtn" onclick="saveStrategy()" disabled class="px-4 py-2 text-xs font-bold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition disabled:opacity-40">Save</button>
+                        <button id="editorDeleteBtn" onclick="deleteStrategy()" disabled class="px-3 py-2 text-xs font-bold text-red-600 bg-red-50 border border-red-100 rounded-lg hover:bg-red-100 transition disabled:opacity-40">Delete</button>
+                    </div>
+
+                    <div id="editorHost" class="h-[55vh] min-h-[20rem] overflow-hidden"></div>
+
+                    <div class="border-t border-slate-100 px-4 md:px-5 py-3 space-y-3">
+                        <div id="editorStatus" class="text-xs text-slate-400">Nothing checked yet.</div>
+                        <div id="editorDiagnostics" class="hidden space-y-1"></div>
+                        <div id="editorParams" class="hidden">
+                            <h4 class="text-[10px] font-bold text-slate-400 uppercase mb-2">Parameters this strategy declares</h4>
+                            <div id="editorParamList" class="grid grid-cols-1 sm:grid-cols-2 gap-2"></div>
+                            <!-- Declared, not yet wired to a run: the engine
+                                 reads a strategy's parameters from the file
+                                 itself, so changing one here would be a lie
+                                 until there is a per-run override. -->
+                            <p class="text-[11px] text-slate-400 mt-2">Shown as declared in the file. Editing them from here is not wired up yet — change the defaults in the code.</p>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </div>
+
         <div id="section-audit" class="page hidden px-4 md:px-6 lg:px-8 py-6 md:py-8 space-y-6">
             <section class="bg-white px-4 md:px-6 py-4 rounded-2xl border border-slate-200">
                 <h2 class="text-lg md:text-2xl font-bold">Audit</h2>
@@ -472,8 +530,44 @@
     </div>
 </div>
 
+<!-- ══ New Strategy modal ══ -->
+<div id="strategyModal" class="modal opacity-0 pointer-events-none fixed w-full h-full top-0 left-0 flex items-center justify-center z-50">
+    <div class="modal-overlay absolute w-full h-full bg-slate-900 opacity-40" onclick="closeStrategyModal()"></div>
+    <div class="modal-container bg-white w-[95%] sm:w-[90%] md:max-w-lg mx-auto rounded-[32px] shadow-2xl z-50 overflow-hidden max-h-[90vh] overflow-y-auto">
+        <div class="py-6 md:py-8 px-6 md:px-10">
+            <h2 class="text-xl md:text-2xl font-black mb-1">New strategy</h2>
+            <p class="text-xs text-slate-500 mb-6">FinHub writes you a working Bollinger strategy with these filled in, so there is something to run before there is something to change.</p>
+            <form id="strategyForm" class="space-y-4">
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Name</label>
+                    <input type="text" id="strategyName" value="My strategy" maxlength="80" required class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-slate-900">
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Symbol</label>
+                    <input type="text" id="strategySymbol" value="2317" maxlength="12" required class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none focus:ring-2 focus:ring-slate-900">
+                    <!-- The symbol belongs to the strategy, not to the run: a
+                         band width calibrated on a 50-dollar ETF means nothing
+                         on a 1,000-dollar semiconductor. -->
+                    <p class="text-[11px] text-slate-400 mt-2">One symbol per strategy. Thresholds calibrated on one stock rarely transfer to another, so the symbol is part of the strategy rather than an argument to it.</p>
+                </div>
+                <div>
+                    <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Start from</label>
+                    <select id="strategyTemplate" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none">
+                        <option value="starter" selected>Bollinger mean reversion (complete, runnable)</option>
+                        <option value="blank">Nearly blank (on_bar that holds)</option>
+                    </select>
+                </div>
+                <button type="submit" id="strategySubmit" class="w-full bg-slate-900 text-white font-bold py-3.5 rounded-2xl mt-2 hover:bg-slate-800 shadow-lg transition disabled:opacity-40">Create</button>
+                <button type="button" onclick="closeStrategyModal()" class="w-full text-slate-400 text-xs font-bold mt-1 uppercase tracking-widest hover:text-slate-500 transition">Cancel</button>
+            </form>
+            <div id="strategyFormError" class="mt-3 text-xs text-red-600"></div>
+        </div>
+    </div>
+</div>
+
 <div id="toast" class="fixed bottom-6 right-6 z-[60] space-y-2"></div>
 
+<script src="/static/vendor/codemirror.bundle.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>

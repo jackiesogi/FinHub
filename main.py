@@ -22,6 +22,7 @@ from fastapi import Depends
 from fastapi import FastAPI
 from fastapi import HTTPException
 from fastapi import Request
+from fastapi import Response
 from fastapi.responses import HTMLResponse
 from fastapi.responses import PlainTextResponse
 from fastapi.security import OAuth2PasswordRequestForm
@@ -40,6 +41,8 @@ from cjtrade import EngineClient
 from cjtrade import EngineUnavailable
 from cjtrade import RunConfig
 from cjtrade import RunSupervisor
+from cjtrade import StrategyTool
+from cjtrade import StrategyToolError
 from cjtrade import SupervisorError
 from config import settings
 from database import engine as db_engine
@@ -58,6 +61,7 @@ engine_client = EngineClient(settings.engine_base_url)
 broker_client = ArenaXClient(settings.arenax_base_url, settings.ARENAX_API_KEY)
 supervisor = RunSupervisor(repo=settings.CJTRADE_REPO, uv_bin=settings.UV_BIN,
                            log_dir=settings.RUN_LOG_DIR)
+strategy_tool = StrategyTool(repo=settings.CJTRADE_REPO, uv_bin=settings.UV_BIN)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,9 +99,45 @@ def _close_out_orphaned_runs() -> None:
                         ", ".join(str(r.id) for r in stale))
 
 
+def _ensure_schema() -> None:
+    """Add columns that `create_all` cannot, because the table already exists.
+
+    There is no migration tool here, and for a handful of nullable columns on
+    a single-file SQLite database one is hard to justify. What is not
+    justifiable is a new column silently not existing: `create_all` creates
+    missing *tables* and ignores missing columns, so an older finhub.db would
+    answer every query with "no such column" until somebody deleted it.
+
+    Narrow on purpose -- only ever adds a nullable column. Anything that needs
+    a backfill, a rename or a type change needs a real migration and should
+    not be smuggled in here.
+    """
+    from sqlalchemy import inspect
+    from sqlalchemy import text
+
+    additions = {
+        # (table, column): DDL
+        ("bot_slots", "strategy_id"): "INTEGER REFERENCES strategies(id)",
+    }
+
+    inspector = inspect(db_engine)
+    tables = set(inspector.get_table_names())
+    with db_engine.begin() as connection:
+        for (table, column), ddl in additions.items():
+            if table not in tables:
+                continue            # create_all will make it with the column
+            existing = {c["name"] for c in inspector.get_columns(table)}
+            if column in existing:
+                continue
+            connection.execute(
+                text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+            log.warning("added %s.%s to an existing database", table, column)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     models.Base.metadata.create_all(bind=db_engine)
+    _ensure_schema()
     # Before the watcher starts, so it never sees a row it cannot explain.
     _close_out_orphaned_runs()
     log.info("engine status API : %s", settings.engine_base_url)
@@ -249,7 +289,7 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")),
 # ══════════════════════════════════════════════════════════════════════════════
 
 PAGES = ("dashboard", "runs", "bots", "positions", "orders", "market",
-         "trade", "audit")
+         "trade", "editor", "audit")
 
 
 @app.get("/", response_class=HTMLResponse, tags=["Frontend"])
@@ -332,6 +372,90 @@ async def engine_bots(current_user: models.User = Depends(get_current_user)):
         return {"available": True, "bots": await engine_client.bots()}
     except EngineUnavailable as exc:
         return _absent(str(exc))
+
+
+@app.get("/api/v1/bots", tags=["Engine"])
+async def bots_overview(db: Session = Depends(get_db),
+                        current_user: models.User = Depends(get_current_user)):
+    """Every bot you have, running or not.
+
+    `/api/v1/engine/bots` is the engine's live view and nothing else: between
+    runs it is empty, so a strategy somebody wrote was invisible until a run
+    happened to be in flight. This answers the question the page is actually
+    asking -- what bots exist, and which of them are alive right now -- by
+    putting the saved strategies and the engine's live report side by side.
+
+    A live bot that matches none of your strategies is still listed. The engine
+    ships built-in bots, and a bot that is trading must never be missing from
+    the page that shows bots.
+    """
+    live: dict = {}
+    engine_available = True
+    engine_reason = ""
+    try:
+        live = await engine_client.bots() or {}
+    except EngineUnavailable as exc:
+        engine_available = False
+        engine_reason = str(exc)
+
+    # bot_id -> the most recent slot that used it, across this user's runs.
+    # Most recent, because a bot id is reused from run to run and the live
+    # report is about the newest one.
+    slots: dict[str, models.BotSlot] = {}
+    for slot in (db.query(models.BotSlot)
+                 .join(models.Run, models.BotSlot.run_id == models.Run.id)
+                 .filter(models.Run.owner_id == current_user.id)
+                 .order_by(models.Run.id.desc()).all()):
+        slots.setdefault(slot.bot_id, slot)
+
+    bot_for_strategy = {s.strategy_id: bot_id for bot_id, s in slots.items()
+                        if s.strategy_id is not None}
+
+    out: list[dict] = []
+    claimed: set[str] = set()
+
+    for strategy in (db.query(models.Strategy)
+                     .filter(models.Strategy.owner_id == current_user.id)
+                     .order_by(models.Strategy.updated_at.desc(),
+                               models.Strategy.id.desc()).all()):
+        bot_id = bot_for_strategy.get(strategy.id)
+        status = live.get(bot_id) if bot_id else None
+        if bot_id is not None and bot_id in live:
+            claimed.add(bot_id)
+        out.append({
+            "kind": "strategy",
+            "strategy_id": strategy.id,
+            "bot_id": bot_id,
+            "name": strategy.name,
+            "symbol": strategy.symbol,
+            "live": status is not None,
+            "check_ok": strategy.last_check_ok,
+            "check_error": strategy.last_check_error,
+            "updated_at": strategy.updated_at,
+            "status": status,
+        })
+
+    for bot_id, status in live.items():
+        if bot_id in claimed:
+            continue
+        slot = slots.get(bot_id)
+        out.append({
+            "kind": "engine",
+            "strategy_id": None,
+            "bot_id": bot_id,
+            # The name recorded when the run started, which survives the
+            # strategy being renamed or deleted.
+            "name": (slot.strategy if slot and slot.strategy else bot_id),
+            "symbol": (slot.symbol if slot else ""),
+            "live": True,
+            "check_ok": None,
+            "check_error": None,
+            "updated_at": None,
+            "status": status,
+        })
+
+    return {"engine_available": engine_available, "reason": engine_reason,
+            "bots": out}
 
 
 @app.get("/api/v1/engine/bots/{bot_id}/history", tags=["Engine"])
@@ -658,6 +782,170 @@ def run_log(run_id: int, lines: int = 300, db: Session = Depends(get_db),
 def supervisor_state(current_user: models.User = Depends(get_current_user)):
     """What FinHub currently has running, and where CJTrade is."""
     return supervisor.describe()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Strategies — what somebody wrote in the editor
+#
+#  Writing a strategy is writing Python that this host will execute. FinHub is
+#  a single trust domain: an account on it is permission to run code here, and
+#  nothing below pretends otherwise. What these routes do enforce is ownership
+#  -- one user cannot read or edit another's source -- and that the checker
+#  only ever runs over a bounded amount of text.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _owned_strategy(strategy_id: int, db: Session,
+                    user: models.User) -> models.Strategy:
+    """Someone else's strategy is reported as missing rather than forbidden.
+
+    A 403 would confirm that strategy 41 exists and belongs to another user,
+    which is a thing this endpoint has no reason to tell anyone.
+    """
+    strategy = db.get(models.Strategy, strategy_id)
+    if strategy is None or strategy.owner_id != user.id:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+    return strategy
+
+
+@app.get("/api/v1/strategies", response_model=list[schemas.StrategySummary],
+         tags=["Strategies"])
+def list_strategies(db: Session = Depends(get_db),
+                    current_user: models.User = Depends(get_current_user)):
+    return (db.query(models.Strategy)
+            .filter(models.Strategy.owner_id == current_user.id)
+            .order_by(models.Strategy.updated_at.desc(),
+                      models.Strategy.id.desc())
+            .all())
+
+
+@app.get("/api/v1/strategies/api-reference", tags=["Strategies"])
+def strategy_api_reference(
+        current_user: models.User = Depends(get_current_user)):
+    """Every name a strategy may use, for the editor's completion.
+
+    Generated in the CJTrade checkout by introspecting the authoring module, so
+    there is no second list to maintain: a function added or removed there
+    changes what the editor offers on the next page load. Declared before the
+    `/{strategy_id}` route so "api-reference" is not read as an id.
+    """
+    try:
+        return {"entries": strategy_tool.api_reference()}
+    except StrategyToolError as exc:
+        # The editor is still usable without this -- it falls back to
+        # CodeMirror's own Python completion -- so this is not a 500.
+        log.warning("could not load the strategy API reference: %s", exc)
+        return {"entries": [], "error": str(exc)}
+
+
+@app.get("/api/v1/strategies/{strategy_id}",
+         response_model=schemas.StrategySchema, tags=["Strategies"])
+def get_strategy(strategy_id: int, db: Session = Depends(get_db),
+                 current_user: models.User = Depends(get_current_user)):
+    return _owned_strategy(strategy_id, db, current_user)
+
+
+@app.post("/api/v1/strategies", response_model=schemas.StrategySchema,
+          status_code=201, tags=["Strategies"])
+def create_strategy(strategy_in: schemas.StrategyCreate,
+                    db: Session = Depends(get_db),
+                    current_user: models.User = Depends(get_current_user)):
+    """Create a strategy, pre-filled unless the caller supplied source.
+
+    The template comes from CJTrade rather than from here, because it is a
+    demonstration of CJTrade's authoring API -- if `buy()` grows an argument,
+    the file that teaches it should change with it, not a string in FinHub.
+    """
+    source = strategy_in.source
+    if source is None:
+        try:
+            source = strategy_tool.template(strategy_in.name,
+                                            strategy_in.symbol)
+        except StrategyToolError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    strategy = models.Strategy(
+        owner_id=current_user.id, name=strategy_in.name.strip(),
+        symbol=strategy_in.symbol.strip().upper(), source=source)
+    db.add(strategy)
+    db.commit()
+    db.refresh(strategy)
+    _audit(db, current_user, "strategy.create", f"strategy:{strategy.id}",
+           f"{strategy.name} ({strategy.symbol})")
+    return strategy
+
+
+@app.put("/api/v1/strategies/{strategy_id}",
+         response_model=schemas.StrategySchema, tags=["Strategies"])
+def update_strategy(strategy_id: int, patch: schemas.StrategyUpdate,
+                    db: Session = Depends(get_db),
+                    current_user: models.User = Depends(get_current_user)):
+    strategy = _owned_strategy(strategy_id, db, current_user)
+
+    if patch.name is not None:
+        strategy.name = patch.name.strip()
+    if patch.symbol is not None:
+        strategy.symbol = patch.symbol.strip().upper()
+    if patch.source is not None and patch.source != strategy.source:
+        strategy.source = patch.source
+        # The stored verdict described the old source. Clearing it is the
+        # honest answer until someone checks again -- leaving a green tick on
+        # text nobody has checked is worse than showing nothing.
+        strategy.last_check_ok = None
+        strategy.last_check_error = None
+
+    db.commit()
+    db.refresh(strategy)
+    return strategy
+
+
+@app.delete("/api/v1/strategies/{strategy_id}", status_code=204,
+            tags=["Strategies"])
+def delete_strategy(strategy_id: int, db: Session = Depends(get_db),
+                    current_user: models.User = Depends(get_current_user)):
+    strategy = _owned_strategy(strategy_id, db, current_user)
+    name = strategy.name
+    db.delete(strategy)
+    db.commit()
+    _audit(db, current_user, "strategy.delete", f"strategy:{strategy_id}", name)
+    return Response(status_code=204)
+
+
+@app.post("/api/v1/strategies/check", tags=["Strategies"])
+def check_strategy(payload: schemas.StrategyCheckRequest,
+                   current_user: models.User = Depends(get_current_user)):
+    """Diagnostics and declared parameters for source that may not be saved.
+
+    Answers 200 for a file full of errors: "this does not compile" is a
+    successful answer to the question asked, and the editor needs the
+    diagnostics in the body either way. A 502 means the checker itself could
+    not run.
+    """
+    try:
+        return strategy_tool.check(payload.source)
+    except StrategyToolError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/v1/strategies/{strategy_id}/check", tags=["Strategies"])
+def check_saved_strategy(strategy_id: int, db: Session = Depends(get_db),
+                         current_user: models.User = Depends(get_current_user)):
+    """Check what is stored, and remember the verdict.
+
+    Remembered so the list can show which strategies are runnable without
+    spawning one subprocess per row.
+    """
+    strategy = _owned_strategy(strategy_id, db, current_user)
+    try:
+        result = strategy_tool.check(strategy.source)
+    except StrategyToolError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    errors = [d for d in result.get("diagnostics", [])
+              if d.get("severity") != "warning"]
+    strategy.last_check_ok = 1 if result.get("ok") else 0
+    strategy.last_check_error = (errors[0]["message"][:400] if errors else None)
+    db.commit()
+    return result
 
 
 # ══════════════════════════════════════════════════════════════════════════════

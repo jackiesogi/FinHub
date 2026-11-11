@@ -10,8 +10,10 @@ from typing import List
 from typing import Optional
 
 from pydantic import BaseModel
+from pydantic import ConfigDict
 from pydantic import EmailStr
 from pydantic import Field
+from pydantic import field_validator
 
 
 # ── Identity ──────────────────────────────────────────────────────────────────
@@ -131,3 +133,73 @@ class AuditLogSchema(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+# ── Strategies ────────────────────────────────────────────────────────────────
+
+# Trimmed before the pattern is applied, so " 0050 " from a form field is a
+# symbol rather than a 422. The pattern still rejects a symbol with a space
+# *inside* it, which is two symbols in one field.
+#
+# Field by field rather than `str_strip_whitespace` on the model, because that
+# setting is model-wide and would also strip `source` -- silently deleting the
+# trailing newline from every file anybody saves.
+def _trim(value):
+    return value.strip() if isinstance(value, str) else value
+
+
+class StrategyCreate(BaseModel):
+    """A new strategy. `source` is optional — left out, the server fills in a
+    working starter strategy with the name and symbol already in it, because a
+    blank editor is the worst place to learn an API from."""
+    name: str = Field(min_length=1, max_length=80)
+    symbol: str = Field(min_length=1, max_length=12,
+                        pattern=r"^[A-Za-z0-9._-]+$")
+    source: Optional[str] = None
+
+    _trim_text = field_validator("name", "symbol",
+                                 mode="before")(_trim)
+
+
+class StrategyUpdate(BaseModel):
+    """Every field optional, so saving the editor does not have to resend the
+    name and symbol, and renaming does not have to resend the source."""
+    name: Optional[str] = Field(default=None, min_length=1, max_length=80)
+    symbol: Optional[str] = Field(default=None, min_length=1, max_length=12,
+                                  pattern=r"^[A-Za-z0-9._-]+$")
+    source: Optional[str] = None
+
+    _trim_text = field_validator("name", "symbol",
+                                 mode="before")(_trim)
+
+
+class StrategySchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    symbol: str
+    source: str
+    last_check_ok: Optional[int] = None
+    last_check_error: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class StrategySummary(BaseModel):
+    """The list view. Without `source`, because a list of twenty strategies is
+    otherwise a list of twenty files."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    symbol: str
+    last_check_ok: Optional[int] = None
+    last_check_error: Optional[str] = None
+    updated_at: Optional[datetime] = None
+
+
+class StrategyCheckRequest(BaseModel):
+    """Check source that may not be saved yet, which is the normal case — the
+    editor validates what is on screen."""
+    source: str = Field(max_length=256_000)

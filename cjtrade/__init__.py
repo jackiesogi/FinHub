@@ -32,6 +32,8 @@ from .arenax_client import ArenaXClient
 from .arenax_client import BrokerError
 from .engine_client import EngineClient
 from .engine_client import EngineUnavailable
+from .strategy_tool import StrategyTool
+from .strategy_tool import StrategyToolError
 from .supervisor import RunConfig
 from .supervisor import RunSupervisor
 from .supervisor import SupervisorError
@@ -43,5 +45,7 @@ __all__ = [
     "EngineUnavailable",
     "RunConfig",
     "RunSupervisor",
+    "StrategyTool",
+    "StrategyToolError",
     "SupervisorError",
 ]

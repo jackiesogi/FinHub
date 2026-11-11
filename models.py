@@ -11,6 +11,8 @@ lives here is what nothing else keeps:
 * `ManualOrder` -- that a human, not a bot, placed this order. The broker
               records the order but not who asked for it, and the engine's
               risk gate never saw it.
+* `Strategy` -- source somebody wrote in the editor. Nothing else keeps it:
+              the engine is handed a file and forgets it when the run ends.
 """
 from datetime import datetime
 
@@ -39,6 +41,8 @@ class User(Base):
                         cascade="all, delete-orphan")
     manual_orders = relationship("ManualOrder", back_populates="owner",
                                  cascade="all, delete-orphan")
+    strategies = relationship("Strategy", back_populates="owner",
+                              cascade="all, delete-orphan")
     audit_logs = relationship("AuditLog", back_populates="user_ref")
 
 
@@ -103,10 +107,19 @@ class BotSlot(Base):
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("runs.id", ondelete="CASCADE"))
     bot_id = Column(String, index=True)
+    # The strategy's name as it was at launch, kept as text so a run stays
+    # readable after the strategy is renamed or deleted.
     strategy = Column(String, default="")
     symbol = Column(String, default="")
+    # Which saved strategy this was, when it was one. Null for the built-in
+    # bots, and nulled again if the strategy is later deleted -- the row is the
+    # record that a run happened, so it must outlive the source it ran.
+    strategy_id = Column(Integer,
+                         ForeignKey("strategies.id", ondelete="SET NULL"),
+                         nullable=True, index=True)
 
     run = relationship("Run", back_populates="bot_slots")
+    strategy_ref = relationship("Strategy", back_populates="bot_slots")
 
 
 class ManualOrder(Base):
@@ -153,3 +166,40 @@ class AuditLog(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     user_ref = relationship("User", back_populates="audit_logs")
+
+
+class Strategy(Base):
+    """Source somebody wrote in the editor, and which symbol it is for.
+
+    Here rather than as a file on disk because a strategy belongs to a user and
+    the filesystem has no opinion about that. The engine does get a file -- the
+    supervisor writes one out when a run starts -- but that file is a copy made
+    for one run, not the record.
+
+    `symbol` is part of the strategy rather than part of the run: a strategy
+    written against a 50-cent ETF and one written against a 1,000-dollar
+    semiconductor are not the same strategy with a different argument, and
+    pretending otherwise is how thresholds end up meaning nothing (see the ADX
+    measurement in CJTrade's adx.py).
+    """
+    __tablename__ = "strategies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner_id = Column(Integer, ForeignKey("users.id"), index=True)
+    name = Column(String, index=True)
+    symbol = Column(String, default="", index=True)
+    source = Column(Text, default="")
+    # Last thing the checker said about this source. Stored so the list can
+    # show which strategies are runnable without re-checking every one of
+    # them -- each check is a subprocess in the CJTrade checkout.
+    last_check_ok = Column(Integer, nullable=True)      # 1 | 0 | null = never
+    last_check_error = Column(String, nullable=True)
+    created_at = Column(DateTime, default=func.now())
+    updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
+
+    owner = relationship("User", back_populates="strategies")
+    # Not a delete cascade: deleting a strategy takes it off the bots page but
+    # must not erase the record of the runs that used it. SQLAlchemy nulls the
+    # child's strategy_id, which is what leaves a past bot labelled by the
+    # name recorded in BotSlot.strategy.
+    bot_slots = relationship("BotSlot", back_populates="strategy_ref")
