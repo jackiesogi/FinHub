@@ -284,11 +284,17 @@ async function loadEquity() {
 function drawEquity(curve) {
     const ctx = document.getElementById('equityChart');
     if (!ctx) return;
-    const labels = curve.map(p => p.time.replace('T', ' ').slice(5, 16));
+    const stamps = curve.map(p => p.time);
+    /* Was a fixed slice(5, 16), which never showed the year on a run that
+     * crossed one and spent the space on a date when every point was from the
+     * same session. */
+    const labels = marketTimeLabels(stamps) || curve.map((_, i) => i);
     const values = curve.map(p => p.value);
     if (equityChart) {
         equityChart.data.labels = labels;
         equityChart.data.datasets[0].data = values;
+        equityChart.options.plugins.tooltip.callbacks.title =
+            fullStampTooltip(stamps);
         equityChart.update('none');
         return;
     }
@@ -302,7 +308,10 @@ function drawEquity(curve) {
         options: {
             responsive: true, maintainAspectRatio: false,
             animation: false,
-            plugins: { legend: { display: false } },
+            plugins: {
+                legend: { display: false },
+                tooltip: { callbacks: { title: fullStampTooltip(stamps) } },
+            },
             scales: {
                 x: { ticks: { maxTicksLimit: 10, font: { size: 10 } }, grid: { display: false } },
                 y: { ticks: { font: { size: 10 } }, grid: { color: '#f1f5f9' } },
@@ -655,6 +664,50 @@ async function loadBotHistory(botId) {
 const PLOT_COLOURS = ['#2563eb', '#0f172a', '#7c3aed', '#059669', '#d97706',
                       '#db2777', '#0891b2'];
 
+/* Axis labels for a run of market timestamps, at the coarsest granularity
+ * that still tells them apart.
+ *
+ *   all in one day    HH:MM              a live run is 200 bars = 200 minutes
+ *   within one year   MM-DD HH:MM
+ *   across years      YY-MM-DD HH:MM
+ *
+ * Market time, not wall clock: a replay of September 2026 happened this
+ * afternoon, and labelling it with this afternoon would make the chart a lie.
+ *
+ * Sliced from the ISO string rather than parsed into a Date. These stamps come
+ * from Python's isoformat() and carry no offset, so handing them to `new Date`
+ * invites the browser's timezone into a number that has nothing to do with it.
+ * The format is fixed, so the slice is exact.
+ *
+ * Returns null when there are no usable stamps, which is the caller's signal
+ * to fall back to bar numbers -- an empty axis would be worse than a crude one. */
+function marketTimeLabels(stamps) {
+    const usable = stamps.filter(s => typeof s === 'string' && s.length >= 16);
+    if (!usable.length) return null;
+    const granularity = new Set(usable.map(s => s.slice(0, 4))).size > 1 ? 'year'
+        : new Set(usable.map(s => s.slice(0, 10))).size > 1 ? 'date'
+        : 'time';
+    return stamps.map(s => {
+        if (typeof s !== 'string' || s.length < 16) return '';
+        const time = s.slice(11, 16);
+        if (granularity === 'time') return time;
+        if (granularity === 'date') return `${s.slice(5, 10)} ${time}`;
+        return `${s.slice(2, 10)} ${time}`;
+    });
+}
+
+/* The full stamp for a tooltip, so shortening the axis loses nothing. */
+function fullStampTooltip(stamps, extra) {
+    return (items) => {
+        const i = items[0].dataIndex;
+        const stamp = stamps[i];
+        const head = (typeof stamp === 'string')
+            ? stamp.replace('T', ' ').slice(0, 19) : null;
+        const tail = extra ? extra(i) : null;
+        return [head, tail].filter(Boolean).join('  ·  ') || '';
+    };
+}
+
 /* The span of a series, ignoring the nulls a warm-up leaves behind. */
 function spanOf(values) {
     const numbers = values.filter(v => typeof v === 'number' && isFinite(v));
@@ -683,7 +736,8 @@ function sharesPriceAxis(series, price) {
 function drawBotChart(rows) {
     const ctx = document.getElementById('botChart');
     if (!ctx) return;
-    const labels = rows.map(r => int(r.bar_index));
+    const stamps = rows.map(r => r.market_time);
+    const labels = marketTimeLabels(stamps) || rows.map(r => int(r.bar_index));
 
     /* The price is always drawn. It comes from the bot, which is the process
      * that turned master's broadcast into the bar its strategy saw, so it is
@@ -772,7 +826,13 @@ function drawBotChart(rows) {
         type: 'line', data: { labels, datasets },
         options: {
             responsive: true, maintainAspectRatio: false, animation: false,
-            plugins: { legend: { labels: { font: { size: 10 }, boxWidth: 12 } } },
+            plugins: {
+                legend: { labels: { font: { size: 10 }, boxWidth: 12 } },
+                tooltip: { callbacks: {
+                    title: fullStampTooltip(
+                        stamps, i => `bar ${int(rows[i].bar_index)}`),
+                } },
+            },
             scales,
             interaction: { mode: 'index', intersect: false },
         },
