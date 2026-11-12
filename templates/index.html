@@ -417,7 +417,10 @@
                          strategy is Python that runs on this host. -->
                     <p class="text-xs text-slate-500 mt-1">A strategy is Python that runs on this machine, inside the engine's risk gate. Only you can see yours.</p>
                 </div>
-                <button onclick="openStrategyModal()" class="px-4 md:px-6 py-2.5 text-sm font-bold text-white bg-slate-900 rounded-lg shadow-md hover:bg-slate-800 transition w-full sm:w-auto">+ New Strategy</button>
+                <div class="flex gap-2 w-full sm:w-auto">
+                    <button onclick="restoreExamples()" class="px-4 py-2.5 text-sm font-bold text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 transition flex-1 sm:flex-none" title="Copy back any of the built-in strategies you no longer have">Restore examples</button>
+                    <button onclick="openStrategyModal()" class="px-4 md:px-6 py-2.5 text-sm font-bold text-white bg-slate-900 rounded-lg shadow-md hover:bg-slate-800 transition flex-1 sm:flex-none">+ New Strategy</button>
+                </div>
             </section>
 
             <div class="grid grid-cols-1 lg:grid-cols-[18rem_1fr] gap-4 md:gap-6">
@@ -437,6 +440,13 @@
                             <div class="text-[11px] text-slate-400" id="editorSubtitle">Pick one on the left, or make a new one</div>
                         </div>
                         <span id="editorDirty" class="hidden text-[10px] font-bold uppercase tracking-widest text-amber-600">Unsaved</span>
+                        <!-- Off means off now: if this strategy is trading in
+                             the run that is going, its bot is stopped. It does
+                             not sell what the strategy already holds. -->
+                        <label class="flex items-center gap-2 text-xs font-bold text-slate-500 cursor-pointer select-none" title="Off stops its bot in the run that is going, and leaves it out of the next one. It does not sell what it holds.">
+                            <input type="checkbox" id="editorEnabled" onchange="toggleEditorEnabled()" disabled class="accent-slate-900 w-4 h-4">
+                            <span id="editorEnabledLabel">Enabled</span>
+                        </label>
                         <button id="editorCheckBtn" onclick="checkStrategy()" disabled class="px-3 py-2 text-xs font-bold text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 transition disabled:opacity-40">Check</button>
                         <button id="editorSaveBtn" onclick="saveStrategy()" disabled class="px-4 py-2 text-xs font-bold text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition disabled:opacity-40">Save</button>
                         <button id="editorDeleteBtn" onclick="deleteStrategy()" disabled class="px-3 py-2 text-xs font-bold text-red-600 bg-red-50 border border-red-100 rounded-lg hover:bg-red-100 transition disabled:opacity-40">Delete</button>
@@ -552,10 +562,12 @@
                 </div>
                 <div>
                     <label class="block text-[10px] font-bold text-slate-400 uppercase mb-1 ml-1">Start from</label>
-                    <select id="strategyTemplate" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none">
-                        <option value="starter" selected>Bollinger mean reversion (complete, runnable)</option>
-                        <option value="blank">Nearly blank (on_bar that holds)</option>
+                    <!-- Filled from CJTrade's own list of templates, so adding
+                         one there changes this without an edit here. -->
+                    <select id="strategyTemplate" onchange="showTemplateNote()" class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-bold outline-none">
+                        <option value="bb" selected>Bollinger mean reversion</option>
                     </select>
+                    <p class="text-[11px] text-slate-400 mt-2" id="strategyTemplateNote">&nbsp;</p>
                 </div>
                 <button type="submit" id="strategySubmit" class="w-full bg-slate-900 text-white font-bold py-3.5 rounded-2xl mt-2 hover:bg-slate-800 shadow-lg transition disabled:opacity-40">Create</button>
                 <button type="button" onclick="closeStrategyModal()" class="w-full text-slate-400 text-xs font-bold mt-1 uppercase tracking-widest hover:text-slate-500 transition">Cancel</button>

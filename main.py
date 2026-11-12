@@ -62,6 +62,10 @@ broker_client = ArenaXClient(settings.arenax_base_url, settings.ARENAX_API_KEY)
 supervisor = RunSupervisor(repo=settings.CJTRADE_REPO, uv_bin=settings.UV_BIN,
                            log_dir=settings.RUN_LOG_DIR)
 strategy_tool = StrategyTool(repo=settings.CJTRADE_REPO, uv_bin=settings.UV_BIN)
+# How the engine client finds the current run's control token. Asked for each
+# call rather than copied, so it is never stale: the token belongs to a run,
+# and the supervisor forgets it the moment that run's children are gone.
+engine_client.token_provider = lambda: supervisor.control_token
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -118,6 +122,12 @@ def _ensure_schema() -> None:
     additions = {
         # (table, column): DDL
         ("bot_slots", "strategy_id"): "INTEGER REFERENCES strategies(id)",
+        # NOT NULL with a default, so existing rows become enabled rather than
+        # null -- a strategy that predates the column was trading, and the
+        # migration should not quietly switch it off.
+        ("strategies", "enabled"): "INTEGER NOT NULL DEFAULT 1",
+        ("strategies", "seeded_from"): "VARCHAR",
+        ("users", "examples_seeded"): "INTEGER NOT NULL DEFAULT 0",
     }
 
     inspector = inspect(db_engine)
@@ -322,6 +332,13 @@ def register(user_in: schemas.UserCreate, db: Session = Depends(get_db)):
     user = models.User(username=user_in.username, email=user_in.email,
                        hashed_password=auth.hash_password(user_in.password))
     db.add(user)
+    db.flush()
+    # The three strategies the engine's built-in bots run, as editable copies.
+    # Seeded here rather than on first page load so a new account has something
+    # to read on day one -- a blank editor is the worst place to learn an API
+    # from. Best effort: a checkout that cannot produce templates must not stop
+    # somebody registering.
+    _seed_examples_for(db, user)
     db.commit()
     db.refresh(user)
     return user
@@ -429,6 +446,8 @@ async def bots_overview(db: Session = Depends(get_db),
             "name": strategy.name,
             "symbol": strategy.symbol,
             "live": status is not None,
+            "enabled": bool(strategy.enabled),
+            "seeded_from": strategy.seeded_from,
             "check_ok": strategy.last_check_ok,
             "check_error": strategy.last_check_error,
             "updated_at": strategy.updated_at,
@@ -448,6 +467,10 @@ async def bots_overview(db: Session = Depends(get_db),
             "name": (slot.strategy if slot and slot.strategy else bot_id),
             "symbol": (slot.symbol if slot else ""),
             "live": True,
+            # Not a strategy of ours, so there is no flag to report and
+            # nothing here can switch it off.
+            "enabled": None,
+            "seeded_from": None,
             "check_ok": None,
             "check_error": None,
             "updated_at": None,
@@ -712,8 +735,34 @@ async def start_run(run_in: schemas.RunCreate, db: Session = Depends(get_db),
     db.commit()
     db.refresh(run)
 
+    # Which strategies this run will trade: yours, switched on, known to
+    # compile, and for a symbol this run is watching.
+    #
+    # The symbol filter is not a nicety. The engine refuses to start a bot
+    # whose symbol nobody publishes -- it would sit on a topic that never
+    # carries a bar and then exit on its silence timer, which in the log looks
+    # like a crash. Better to leave it out here and say so.
+    #
+    # `last_check_ok == 1` rather than "not known to be broken": a strategy
+    # that has never been checked would be found broken by the engine at
+    # startup, and finding out then costs a whole run.
+    watched = set(cfg.symbols)
+    candidates = (db.query(models.Strategy)
+                  .filter(models.Strategy.owner_id == current_user.id,
+                          models.Strategy.enabled == 1)
+                  .order_by(models.Strategy.id).all())
+    chosen = [s for s in candidates
+              if s.symbol in watched and s.last_check_ok == 1]
+    skipped = [f"{s.name} ({s.symbol}: "
+               + ("not in the watch list" if s.symbol not in watched
+                  else "not checked yet" if s.last_check_ok is None
+                  else "has errors") + ")"
+               for s in candidates if s not in chosen]
+
     try:
-        info = await supervisor.start(cfg, run.id)
+        info = await supervisor.start(
+            cfg, run.id,
+            strategies=[(s.id, s.name, s.symbol, s.source) for s in chosen])
     except SupervisorError as exc:
         run.status = "failed"
         run.error = str(exc)
@@ -723,14 +772,22 @@ async def start_run(run_in: schemas.RunCreate, db: Session = Depends(get_db),
         raise HTTPException(status_code=409, detail=str(exc))
 
     run.log_path = info["log"]
-    # One slot per symbol. The engine spawns a single hardcoded Bot_C today, so
-    # this records the intent; when it takes more than one bot the UI already
-    # knows which strategy each id was meant to be.
-    db.add(models.BotSlot(run_id=run.id, bot_id="Bot_C", strategy="BB",
-                          symbol=cfg.symbols[0]))
+    # One slot per bot the engine was actually asked to spawn, carrying the
+    # strategy id so the bots page can label a live bot with the strategy it is
+    # running. When no strategy qualified, the engine falls back to its own
+    # built-in roster and there is nothing of ours to record.
+    for bot_id, meta in supervisor.bot_strategies.items():
+        db.add(models.BotSlot(run_id=run.id, bot_id=bot_id,
+                              strategy=meta["name"], symbol=meta["symbol"],
+                              strategy_id=meta["strategy_id"]))
+    if skipped:
+        log.info("run %d left out %d strategy(ies): %s", run.id, len(skipped),
+                 "; ".join(skipped))
     _audit(db, current_user, "START_RUN", str(run.id),
            f"{cfg.mode} {','.join(cfg.symbols)} days={cfg.days} "
-           f"fund={cfg.fund:g} start={cfg.start_date or 'server default'}")
+           f"fund={cfg.fund:g} start={cfg.start_date or 'server default'} "
+           f"bots={len(supervisor.bot_strategies) or 'engine default'}"
+           + (f" skipped={len(skipped)}" if skipped else ""))
     db.commit()
     db.refresh(run)
     return run
@@ -837,6 +894,21 @@ def strategy_api_reference(
         return {"entries": [], "error": str(exc)}
 
 
+@app.get("/api/v1/strategies/templates", tags=["Strategies"])
+def strategy_templates(current_user: models.User = Depends(get_current_user)):
+    """Which starter strategies the editor can offer.
+
+    From the CJTrade checkout, for the same reason the templates themselves
+    are: adding one there should change the dropdown here without an edit.
+    Declared before `/{strategy_id}` so "templates" is not read as an id.
+    """
+    try:
+        return {"templates": strategy_tool.templates()}
+    except StrategyToolError as exc:
+        log.warning("could not list the strategy templates: %s", exc)
+        return {"templates": [], "error": str(exc)}
+
+
 @app.get("/api/v1/strategies/{strategy_id}",
          response_model=schemas.StrategySchema, tags=["Strategies"])
 def get_strategy(strategy_id: int, db: Session = Depends(get_db),
@@ -846,7 +918,7 @@ def get_strategy(strategy_id: int, db: Session = Depends(get_db),
 
 @app.post("/api/v1/strategies", response_model=schemas.StrategySchema,
           status_code=201, tags=["Strategies"])
-def create_strategy(strategy_in: schemas.StrategyCreate,
+def create_strategy(strategy_in: schemas.StrategyCreateFrom,
                     db: Session = Depends(get_db),
                     current_user: models.User = Depends(get_current_user)):
     """Create a strategy, pre-filled unless the caller supplied source.
@@ -859,7 +931,8 @@ def create_strategy(strategy_in: schemas.StrategyCreate,
     if source is None:
         try:
             source = strategy_tool.template(strategy_in.name,
-                                            strategy_in.symbol)
+                                            strategy_in.symbol,
+                                            kind=strategy_in.kind or "bb")
         except StrategyToolError as exc:
             raise HTTPException(status_code=502, detail=str(exc))
 
@@ -896,6 +969,127 @@ def update_strategy(strategy_id: int, patch: schemas.StrategyUpdate,
     db.commit()
     db.refresh(strategy)
     return strategy
+
+
+@app.post("/api/v1/strategies/{strategy_id}/enabled", tags=["Strategies"])
+async def set_strategy_enabled(strategy_id: int, payload: schemas.EnabledPatch,
+                               db: Session = Depends(get_db),
+                               current_user: models.User = Depends(get_current_user)):
+    """Switch a strategy on or off, taking effect now.
+
+    Off means two things and both of them matter:
+
+    * it will not be in the next run, and
+    * if it is trading *right now*, its bot stops right now.
+
+    The second is the point. Whoever presses this during a paper or real run
+    has just found a problem, and "it will not be in the next run" is not an
+    answer to that. The engine grew a control plane for it.
+
+    Stopping is not flattening. The bot places no more orders and its resting
+    orders are pulled back, and the position it already holds is left exactly
+    where it is -- selling it would be a second decision, made at whatever
+    price happens to be there, and nobody asked for that by switching a
+    strategy off.
+
+    Switching it back on does NOT restart a bot mid-run. The engine builds its
+    roster when a run starts, so a re-enabled strategy joins the next one.
+    """
+    strategy = _owned_strategy(strategy_id, db, current_user)
+    was = bool(strategy.enabled)
+    strategy.enabled = 1 if payload.enabled else 0
+    db.commit()
+    db.refresh(strategy)
+
+    result = {"id": strategy.id, "enabled": bool(strategy.enabled),
+              "stopped_now": False, "engine": None}
+
+    if was and not payload.enabled:
+        bot_id = next((b for b, info in supervisor.bot_strategies.items()
+                       if info["strategy_id"] == strategy.id), None)
+        if bot_id is not None:
+            try:
+                result["engine"] = await engine_client.stop_bot(
+                    bot_id, f"{strategy.name} was disabled by "
+                            f"{current_user.username}")
+                result["stopped_now"] = True
+                result["bot_id"] = bot_id
+            except EngineUnavailable as exc:
+                # The flag is already off, so the next run is safe either way.
+                # What failed is the urgent half, and saying so is the whole
+                # point: somebody who pressed this believes it has stopped.
+                log.error("could not stop %s for strategy %d: %s", bot_id,
+                          strategy.id, exc)
+                result["error"] = (
+                    f"{strategy.name} is switched off for the next run, but "
+                    f"its bot {bot_id} could NOT be stopped in the run that "
+                    f"is going: {exc}")
+
+    _audit(db, current_user,
+           "strategy.enable" if payload.enabled else "strategy.disable",
+           f"strategy:{strategy.id}",
+           f"{strategy.name}"
+           + (f" — bot {result.get('bot_id')} stopped"
+              if result["stopped_now"] else ""))
+    db.commit()
+    return result
+
+
+@app.post("/api/v1/strategies/seed-examples", tags=["Strategies"])
+def seed_examples(db: Session = Depends(get_db),
+                  current_user: models.User = Depends(get_current_user)):
+    """Copy the starter strategies into this account.
+
+    Runs once per account automatically (at registration) and can be asked for
+    again from the UI. Idempotent per template: a template already present --
+    or deleted on purpose -- is not copied again, which is what the
+    `examples_seeded` flag on the user is for. Without it, deleting all your
+    strategies would have them reappear on the next page load.
+    """
+    created = _seed_examples_for(db, current_user)
+    db.commit()
+    return {"created": [{"id": s.id, "name": s.name, "symbol": s.symbol,
+                         "kind": s.seeded_from} for s in created]}
+
+
+# The three the engine's built-in bots run, as editable strategies. Symbols
+# match bot_c/bot_a/bot_b so a seeded account mirrors the engine's own roster.
+EXAMPLE_STRATEGIES = (
+    ("bb", "Bollinger mean reversion", "2317"),
+    ("dca", "Monthly DCA", "0050"),
+    ("adx", "Regime switch", "2357"),
+)
+
+
+def _seed_examples_for(db: Session, user: models.User) -> list:
+    """Write the examples this user does not already have. Does not commit."""
+    have = {s.seeded_from for s in
+            db.query(models.Strategy)
+            .filter(models.Strategy.owner_id == user.id).all()
+            if s.seeded_from}
+    created = []
+    for kind, name, symbol in EXAMPLE_STRATEGIES:
+        if kind in have:
+            continue
+        try:
+            source = strategy_tool.template(name, symbol, kind=kind)
+        except StrategyToolError as exc:
+            # Seeding is a convenience, not a prerequisite. A checkout that
+            # cannot produce templates must not stop somebody registering or
+            # using the editor.
+            log.warning("could not seed the %s example: %s", kind, exc)
+            continue
+        strategy = models.Strategy(owner_id=user.id, name=name, symbol=symbol,
+                                   source=source, seeded_from=kind, enabled=1)
+        db.add(strategy)
+        created.append(strategy)
+    if created:
+        db.flush()
+    user.examples_seeded = 1
+    return created
+
+
+
 
 
 @app.delete("/api/v1/strategies/{strategy_id}", status_code=204,

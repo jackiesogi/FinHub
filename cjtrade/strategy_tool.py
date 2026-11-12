@@ -54,12 +54,21 @@ class StrategyTool:
         self.repo = Path(repo)
         self.uv_bin = uv_bin
         self._api_cache: Optional[List[dict]] = None
+        self._templates_cache: Optional[List[dict]] = None
 
     # -- questions --------------------------------------------------------
 
-    def template(self, name: str, symbol: str) -> str:
-        payload = self._run(["template", "--name", name, "--symbol", symbol])
+    def template(self, name: str, symbol: str, kind: str = "bb") -> str:
+        payload = self._run(["template", "--kind", kind,
+                             "--name", name, "--symbol", symbol])
         return payload.get("source", "")
+
+    def templates(self) -> List[dict]:
+        """Which starter strategies there are. Cached like the API reference:
+        identical until the checkout changes."""
+        if self._templates_cache is None:
+            self._templates_cache = self._run(["templates"]).get("templates", [])
+        return self._templates_cache
 
     def check(self, source: str) -> Dict[str, Any]:
         """Returns {"ok": bool, "diagnostics": [...], "params": [...]}."""
@@ -82,8 +91,9 @@ class StrategyTool:
         return self._api_cache
 
     def forget_api(self) -> None:
-        """Drop the cached reference, for when the checkout has changed."""
+        """Drop the cached answers, for when the checkout has changed."""
         self._api_cache = None
+        self._templates_cache = None
 
     # -- plumbing ---------------------------------------------------------
 

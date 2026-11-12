@@ -168,6 +168,7 @@ class StrategyUpdate(BaseModel):
     symbol: Optional[str] = Field(default=None, min_length=1, max_length=12,
                                   pattern=r"^[A-Za-z0-9._-]+$")
     source: Optional[str] = None
+    enabled: Optional[bool] = None
 
     _trim_text = field_validator("name", "symbol",
                                  mode="before")(_trim)
@@ -180,6 +181,8 @@ class StrategySchema(BaseModel):
     name: str
     symbol: str
     source: str
+    enabled: bool = True
+    seeded_from: Optional[str] = None
     last_check_ok: Optional[int] = None
     last_check_error: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -194,6 +197,8 @@ class StrategySummary(BaseModel):
     id: int
     name: str
     symbol: str
+    enabled: bool = True
+    seeded_from: Optional[str] = None
     last_check_ok: Optional[int] = None
     last_check_error: Optional[str] = None
     updated_at: Optional[datetime] = None
@@ -203,3 +208,14 @@ class StrategyCheckRequest(BaseModel):
     """Check source that may not be saved yet, which is the normal case — the
     editor validates what is on screen."""
     source: str = Field(max_length=256_000)
+
+
+class EnabledPatch(BaseModel):
+    """Switch a strategy on or off. A body rather than two routes, so the UI
+    can send the state it wants instead of having to know the current one."""
+    enabled: bool
+
+
+class StrategyCreateFrom(StrategyCreate):
+    """StrategyCreate plus which template to start from."""
+    kind: Optional[str] = Field(default=None, pattern=r"^[a-z]{2,10}$")

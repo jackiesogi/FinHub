@@ -424,11 +424,17 @@ TEMPLATE = ('"""%s — %s"""\n'
 @pytest.fixture
 def fake_checker(monkeypatch):
     """Stand in for the CJTrade subprocess, and record what it was asked."""
-    calls = {"template": [], "check": [], "api": 0}
+    calls = {"template": [], "check": [], "api": 0, "templates": 0}
 
-    def template(name, symbol):
-        calls["template"].append((name, symbol))
+    def template(name, symbol, kind="bb"):
+        calls["template"].append((name, symbol, kind))
         return TEMPLATE % (name, symbol)
+
+    def templates():
+        calls["templates"] += 1
+        return [{"kind": "bb", "label": "Bollinger", "note": "bot_c"},
+                {"kind": "dca", "label": "DCA", "note": "bot_a"},
+                {"kind": "adx", "label": "Regime", "note": "bot_b"}]
 
     def check(source):
         calls["check"].append(source)
@@ -446,6 +452,7 @@ def fake_checker(monkeypatch):
                  "signature": "buy(shares=None)", "doc": "Ask to buy."}]
 
     monkeypatch.setattr(main.strategy_tool, "template", template)
+    monkeypatch.setattr(main.strategy_tool, "templates", templates)
     monkeypatch.setattr(main.strategy_tool, "check", check)
     monkeypatch.setattr(main.strategy_tool, "api_reference", api_reference)
     return calls
@@ -467,7 +474,25 @@ def test_a_new_strategy_is_prefilled_with_the_name_and_symbol(
     assert created["name"] == "Fade the band"
     assert created["symbol"] == "2330"
     assert "Fade the band — 2330" in created["source"]
-    assert fake_checker["template"] == [("Fade the band", "2330")]
+    assert fake_checker["template"] == [("Fade the band", "2330", "bb")]
+
+
+def test_the_requested_template_is_the_one_used(client, authed, fake_checker):
+    _new_strategy(client, authed, kind="dca")
+    assert fake_checker["template"][-1][2] == "dca"
+
+
+def test_the_template_list_comes_from_the_checkout(client, authed,
+                                                   fake_checker):
+    body = client.get("/api/v1/strategies/templates", headers=authed).json()
+    assert [t["kind"] for t in body["templates"]] == ["bb", "dca", "adx"]
+
+
+def test_templates_is_not_shadowed_by_the_id_route(client, authed,
+                                                   fake_checker):
+    """Same hazard as api-reference: "templates" must not parse as an id."""
+    res = client.get("/api/v1/strategies/templates", headers=authed)
+    assert res.status_code == 200, res.text
 
 
 def test_a_supplied_source_is_not_overwritten(client, authed, fake_checker):
@@ -606,8 +631,10 @@ def test_another_users_strategy_is_a_404_not_a_403(client, fake_checker):
     still = client.get(f"/api/v1/strategies/{created['id']}",
                        headers=mine).json()
     assert still["name"] == "Fade the band"
-    assert [s["id"] for s in client.get("/api/v1/strategies",
-                                        headers=theirs).json()] == []
+    # Their list has their own seeded examples and nothing of mine.
+    theirs_ids = [s["id"] for s in
+                  client.get("/api/v1/strategies", headers=theirs).json()]
+    assert created["id"] not in theirs_ids
 
 
 def test_deleting_removes_it(client, authed, fake_checker):
@@ -815,3 +842,227 @@ def _run_with_slot(client, authed, *, bot_id, strategy_id, strategy, symbol):
                               symbol=symbol, strategy_id=strategy_id))
         db.commit()
         return run.id
+
+
+# ── enable / disable ─────────────────────────────────────────────────────────
+#
+# Off has to mean off *now*. Somebody pressing it during a paper or real run
+# has just found a problem, and "it will not be in the next run" is not an
+# answer, so the engine grew a control plane and this is the half that drives
+# it. Off must never be read as "and sell what it holds": that is a second
+# decision, made at whatever price happens to be there.
+
+
+@pytest.fixture
+def fake_engine_stop(monkeypatch):
+    """Stand in for the engine's control plane, and record the calls."""
+    calls = []
+
+    async def stop_bot(bot_id, reason):
+        calls.append((bot_id, reason))
+        return {"ok": True, "bot_id": bot_id, "reason": reason,
+                "orders_cancelled": ["abc123"], "position_flattened": False}
+
+    monkeypatch.setattr(main.engine_client, "stop_bot", stop_bot)
+    return calls
+
+
+def _pretend_running(monkeypatch, mapping):
+    """Make the supervisor look like it is running `mapping` right now."""
+    monkeypatch.setattr(type(main.supervisor), "bot_strategies",
+                        property(lambda self: mapping))
+    monkeypatch.setattr(type(main.supervisor), "control_token",
+                        property(lambda self: "a-token"))
+
+
+def test_a_new_strategy_is_enabled(client, authed, fake_checker):
+    assert _new_strategy(client, authed)["enabled"] is True
+
+
+def test_disabling_between_runs_just_sets_the_flag(client, authed,
+                                                   fake_checker,
+                                                   fake_engine_stop):
+    created = _new_strategy(client, authed)
+    res = client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                      json={"enabled": False}, headers=authed)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["enabled"] is False
+    assert body["stopped_now"] is False
+    assert fake_engine_stop == []          # nothing was running to stop
+    assert client.get(f"/api/v1/strategies/{created['id']}",
+                      headers=authed).json()["enabled"] is False
+
+
+def test_disabling_a_live_strategy_stops_its_bot_now(client, authed,
+                                                     fake_checker,
+                                                     fake_engine_stop,
+                                                     monkeypatch):
+    created = _new_strategy(client, authed, name="Misbehaving")
+    _pretend_running(monkeypatch, {
+        "Bot_S1": {"strategy_id": created["id"], "name": "Misbehaving",
+                   "symbol": "2330"}})
+
+    body = client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                       json={"enabled": False}, headers=authed).json()
+    assert body["stopped_now"] is True
+    assert body["bot_id"] == "Bot_S1"
+    assert len(fake_engine_stop) == 1
+    bot_id, reason = fake_engine_stop[0]
+    assert bot_id == "Bot_S1"
+    assert "Misbehaving" in reason          # the log should say which one
+    # And the answer makes clear what was NOT done.
+    assert body["engine"]["position_flattened"] is False
+
+
+def test_a_stop_that_fails_is_reported_loudly(client, authed, fake_checker,
+                                              monkeypatch):
+    """The flag is off either way, so the next run is safe. What failed is the
+    urgent half, and somebody who pressed this believes trading has stopped."""
+    created = _new_strategy(client, authed)
+    _pretend_running(monkeypatch, {
+        "Bot_S1": {"strategy_id": created["id"], "name": created["name"],
+                   "symbol": "2330"}})
+
+    async def explode(bot_id, reason):
+        raise EngineUnavailable("the engine is not answering")
+    monkeypatch.setattr(main.engine_client, "stop_bot", explode)
+
+    body = client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                       json={"enabled": False}, headers=authed).json()
+    assert body["enabled"] is False        # the flag still changed
+    assert body["stopped_now"] is False
+    assert "could NOT be stopped" in body["error"]
+    assert "not answering" in body["error"]
+
+
+def test_enabling_does_not_pretend_to_start_a_bot(client, authed,
+                                                  fake_checker,
+                                                  fake_engine_stop):
+    """The engine builds its roster when a run starts, so a re-enabled
+    strategy joins the next one -- it does not appear mid-run."""
+    created = _new_strategy(client, authed)
+    client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                json={"enabled": False}, headers=authed)
+    body = client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                       json={"enabled": True}, headers=authed).json()
+    assert body["enabled"] is True
+    assert body["stopped_now"] is False
+    assert fake_engine_stop == []
+
+
+def test_disabling_is_audited(client, authed, fake_checker, fake_engine_stop):
+    created = _new_strategy(client, authed)
+    client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                json={"enabled": False}, headers=authed)
+    actions = [a["action"] for a in
+               client.get("/api/v1/audit", headers=authed).json()]
+    assert "strategy.disable" in actions
+
+
+def test_another_users_strategy_cannot_be_switched_off(client, fake_checker):
+    def account():
+        name = f"toggler_{uuid.uuid4().hex[:8]}"
+        client.post("/api/v1/auth/register", json={
+            "username": name, "email": f"{name}@example.com",
+            "password": "a-long-enough-password"})
+        token = client.post("/api/v1/auth/login", data={
+            "username": name, "password": "a-long-enough-password"
+        }).json()["access_token"]
+        return {"Authorization": f"Bearer {token}"}
+
+    mine, theirs = account(), account()
+    created = _new_strategy(client, mine)
+    res = client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                      json={"enabled": False}, headers=theirs)
+    assert res.status_code == 404
+    assert client.get(f"/api/v1/strategies/{created['id']}",
+                      headers=mine).json()["enabled"] is True
+
+
+def test_a_disabled_strategy_shows_as_off_on_the_bots_page(
+        client, authed, fake_checker, fake_engine_stop, monkeypatch):
+    _no_engine(monkeypatch)
+    created = _new_strategy(client, authed)
+    client.post(f"/api/v1/strategies/{created['id']}/enabled",
+                json={"enabled": False}, headers=authed)
+    assert _bot_entry(client, authed, created["id"])["enabled"] is False
+
+
+# ── seeding the examples ─────────────────────────────────────────────────────
+
+
+def test_registering_seeds_the_example_strategies(client, fake_checker):
+    """A blank editor is the worst place to learn an API from, so a new
+    account starts with the three the engine's built-in bots run."""
+    name = f"fresh_{uuid.uuid4().hex[:8]}"
+    res = client.post("/api/v1/auth/register", json={
+        "username": name, "email": f"{name}@example.com",
+        "password": "a-long-enough-password"})
+    assert res.status_code == 200, res.text
+    token = client.post("/api/v1/auth/login", data={
+        "username": name, "password": "a-long-enough-password"
+    }).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    listed = client.get("/api/v1/strategies", headers=headers).json()
+    assert {s["seeded_from"] for s in listed} == {"bb", "dca", "adx"}
+    assert {s["symbol"] for s in listed} == {"2317", "0050", "2357"}
+    assert all(s["enabled"] for s in listed)
+
+
+def test_deleting_a_seeded_example_keeps_it_deleted(client, fake_checker):
+    """Without the per-template marker, deleting one would have it reappear on
+    the next request, which is a page that will not let you throw things away."""
+    name = f"tidy_{uuid.uuid4().hex[:8]}"
+    client.post("/api/v1/auth/register", json={
+        "username": name, "email": f"{name}@example.com",
+        "password": "a-long-enough-password"})
+    token = client.post("/api/v1/auth/login", data={
+        "username": name, "password": "a-long-enough-password"
+    }).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    listed = client.get("/api/v1/strategies", headers=headers).json()
+    doomed = next(s for s in listed if s["seeded_from"] == "dca")
+    client.delete(f"/api/v1/strategies/{doomed['id']}", headers=headers)
+
+    after = client.get("/api/v1/strategies", headers=headers).json()
+    assert {s["seeded_from"] for s in after} == {"bb", "adx"}
+
+
+def test_restoring_examples_brings_back_only_what_is_missing(client,
+                                                             fake_checker):
+    name = f"restorer_{uuid.uuid4().hex[:8]}"
+    client.post("/api/v1/auth/register", json={
+        "username": name, "email": f"{name}@example.com",
+        "password": "a-long-enough-password"})
+    token = client.post("/api/v1/auth/login", data={
+        "username": name, "password": "a-long-enough-password"
+    }).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    listed = client.get("/api/v1/strategies", headers=headers).json()
+    doomed = next(s for s in listed if s["seeded_from"] == "adx")
+    client.delete(f"/api/v1/strategies/{doomed['id']}", headers=headers)
+
+    body = client.post("/api/v1/strategies/seed-examples",
+                       headers=headers).json()
+    assert [s["kind"] for s in body["created"]] == ["adx"]
+    # Asking again makes nothing: the other two are already there.
+    assert client.post("/api/v1/strategies/seed-examples",
+                       headers=headers).json()["created"] == []
+
+
+def test_a_checkout_that_cannot_make_templates_does_not_block_registering(
+        client, monkeypatch):
+    """Seeding is a convenience, not a prerequisite."""
+    def explode(name, symbol, kind="bb"):
+        raise StrategyToolError("no checkout")
+    monkeypatch.setattr(main.strategy_tool, "template", explode)
+
+    name = f"nocheckout_{uuid.uuid4().hex[:8]}"
+    res = client.post("/api/v1/auth/register", json={
+        "username": name, "email": f"{name}@example.com",
+        "password": "a-long-enough-password"})
+    assert res.status_code == 200, res.text

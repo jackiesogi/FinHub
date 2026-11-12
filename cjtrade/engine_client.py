@@ -11,6 +11,7 @@ and the routes turn that into a quiet "no run" rather than a 500.
 """
 import logging
 from typing import Any
+from typing import Callable
 from typing import Optional
 
 import httpx
@@ -30,18 +31,73 @@ class EngineClient:
         # anything slower than this means the engine is wedged and the UI is
         # better off being told than waiting.
         self.timeout = timeout
+        # How to find the current run's control-plane capability. A callable
+        # rather than a stored value, because the token belongs to a run and
+        # this client outlives every run: caching it here would mean a stale
+        # token after a restart and a forgotten one after a stop, and both
+        # failures look like "the engine refused us" at the worst moment.
+        # Whoever starts the engine sets this; see main.py.
+        self.token_provider: Optional[Callable[[], Optional[str]]] = None
+
+    @property
+    def control_token(self) -> Optional[str]:
+        return self.token_provider() if self.token_provider else None
+
+    def _headers(self) -> dict:
+        token = self.control_token
+        if not token:
+            return {}
+        return {"Authorization": f"Bearer {token}"}
 
     async def _get(self, path: str, params: Optional[dict] = None) -> Any:
         url = f"{self.base_url}{path}"
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(url, params=params)
+                resp = await client.get(url, params=params,
+                                        headers=self._headers())
         except httpx.RequestError as exc:
             raise EngineUnavailable(f"{url}: {exc}") from exc
         if resp.status_code == 404:
             return None
+        if resp.status_code in (401, 403):
+            # Distinguished from "the engine is down", because the two need
+            # different fixes: this one means FinHub and the engine disagree
+            # about the token, which happens if FinHub restarted while a run
+            # it started was still going.
+            raise EngineUnavailable(
+                f"{url}: the engine refused FinHub's control token "
+                f"(HTTP {resp.status_code}) — it is probably from a run that "
+                f"FinHub no longer remembers starting")
         if resp.status_code >= 400:
             raise EngineUnavailable(f"{url}: HTTP {resp.status_code}")
+        return resp.json()
+
+    async def stop_bot(self, bot_id: str, reason: str) -> dict:
+        """Tell the engine to stop one bot, now.
+
+        The only write this client makes. Needs the control token: without one
+        the engine answers 503 and says it has no control plane, which is the
+        honest answer for an engine FinHub did not start.
+        """
+        if not self.control_token:
+            raise EngineUnavailable(
+                "no control token for this run, so there is nothing to "
+                "authorise a stop with — only a run FinHub started can be "
+                "controlled from here")
+        url = f"{self.base_url}/bots/{bot_id}/stop"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.post(url, headers=self._headers(),
+                                         json={"reason": reason})
+        except httpx.RequestError as exc:
+            raise EngineUnavailable(f"{url}: {exc}") from exc
+        if resp.status_code >= 400:
+            detail = ""
+            try:
+                detail = resp.json().get("error", "")
+            except Exception:
+                detail = resp.text[:200]
+            raise EngineUnavailable(f"{url}: HTTP {resp.status_code} {detail}")
         return resp.json()
 
     async def is_up(self) -> bool:

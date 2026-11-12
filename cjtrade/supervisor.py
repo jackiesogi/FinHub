@@ -27,9 +27,11 @@ engine parameterises those ports but `main2.py` passes the defaults, so until
 it takes them as flags, two concurrent runs are not a thing to offer.
 """
 import asyncio
+import json
 import logging
 import os
 import re
+import secrets
 import signal
 import subprocess
 import time
@@ -188,6 +190,11 @@ class Child:
 class RunSupervisor:
     """Owns at most one run's processes."""
 
+    # Where a run's strategy files are written. A copy per run, not a pointer
+    # at the database: somebody editing a strategy while it is trading must not
+    # change what is already running.
+    STRATEGY_DIR_NAME = "run_strategies"
+
     def __init__(self, repo: Path, uv_bin: str, log_dir: Path,
                  arenax_client_factory=None):
         self.repo = Path(repo)
@@ -199,6 +206,15 @@ class RunSupervisor:
         self._run_id: Optional[int] = None
         self._started_at: Optional[datetime] = None
         self._log_path: Optional[Path] = None
+        # The engine's control-plane capability for the current run. Minted
+        # here, handed to the engine in its environment at spawn, and never
+        # written to a log or sent to a browser. None between runs, which is
+        # also what stops a stale token being offered to a new engine.
+        self._control_token: Optional[str] = None
+        # bot_id -> the strategy id it is running, for this run. The engine
+        # does not know about FinHub's database, so this is the only place the
+        # two can be joined.
+        self._bot_strategies: dict = {}
         # Injectable so the tests do not need a broker.
         self._client_factory = arenax_client_factory or (
             lambda base_url, api_key: ArenaXClient(base_url, api_key))
@@ -283,12 +299,67 @@ class RunSupervisor:
 
     # ── starting ──────────────────────────────────────────────────────────────
 
-    async def start(self, cfg: RunConfig, run_id: int) -> dict:
+    @property
+    def control_token(self) -> Optional[str]:
+        """The current run's control-plane capability, or None.
+
+        Read by whoever needs to call the engine's one write route. Not
+        exposed by `describe()` and never logged: a credential in a log file
+        is a credential leaked.
+        """
+        return self._control_token
+
+    @property
+    def bot_strategies(self) -> dict:
+        """bot_id -> strategy id, for the run in flight."""
+        return dict(self._bot_strategies)
+
+    def _write_strategies(self, run_id: int, strategies: list) -> list[dict]:
+        """Write each strategy to its own file and build the engine's roster.
+
+        `strategies` is a list of (strategy_id, name, symbol, source). The
+        source is copied rather than referenced, because the database row can
+        change while the run is going and the file the engine loaded should
+        not.
+
+        The filename is derived from the id, not the name: a name is free text
+        and "../../etc/cron.d/x" is a name. The id is an integer from our own
+        database.
+        """
+        run_dir = (self.log_dir.parent / self.STRATEGY_DIR_NAME
+                   / f"run-{run_id}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        roster = []
+        self._bot_strategies = {}
+        for index, (strategy_id, name, symbol, source) in enumerate(strategies,
+                                                                    start=1):
+            path = run_dir / f"strategy-{int(strategy_id)}.py"
+            path.write_text(source, encoding="utf-8")
+            bot_id = f"Bot_S{index}"
+            roster.append({
+                "bot_id": bot_id,
+                "script": "bot_custom.py",
+                "symbol": symbol,
+                "extra": [str(path)],
+            })
+            self._bot_strategies[bot_id] = {
+                "strategy_id": int(strategy_id), "name": name,
+                "symbol": symbol,
+            }
+        return roster
+
+    async def start(self, cfg: RunConfig, run_id: int,
+                    strategies: Optional[list] = None) -> dict:
         """Bring up the broker (if needed) and then the engine.
 
         Order is not negotiable: the engine connects to the broker during
         startup and aborts if it is absent, so the broker has to be answering
         `running: true` first.
+
+        `strategies` is a list of (id, name, symbol, source) to run as bots.
+        Empty or None leaves the engine on its own built-in roster, which is
+        what a run started before anybody wrote a strategy should do.
         """
         async with self._lock:
             if self.engine_alive:
@@ -311,6 +382,22 @@ class RunSupervisor:
             self._started_at = datetime.now()
             stamp = self._started_at.strftime("%Y%m%d-%H%M%S")
             self._log_path = self.log_dir / f"run-{run_id}-{stamp}.log"
+            # A fresh capability per run, so a token learned from one run is
+            # useless against the next.
+            self._control_token = secrets.token_urlsafe(32)
+            self._bot_strategies = {}
+
+            roster_path: Optional[Path] = None
+            if strategies:
+                roster = self._write_strategies(run_id, strategies)
+                roster_path = (self.log_dir.parent / self.STRATEGY_DIR_NAME
+                               / f"run-{run_id}" / "roster.json")
+                roster_path.write_text(json.dumps(roster, indent=2),
+                                       encoding="utf-8")
+                log.info("run %d will spawn %d strategy bot(s): %s", run_id,
+                         len(roster),
+                         ", ".join(f"{r['bot_id']}={r['symbol']}"
+                                   for r in roster))
 
             client = self._client_factory(
                 f"http://127.0.0.1:{cfg.arenax_port}", "")
@@ -323,7 +410,7 @@ class RunSupervisor:
                 else:
                     self._spawn_broker(cfg)
                     await self._await_broker(client)
-                self._spawn_engine(cfg)
+                self._spawn_engine(cfg, roster_path)
             except Exception:
                 # Never leave half a run behind: if the engine failed to spawn
                 # we would otherwise keep a broker nobody is driving.
@@ -348,9 +435,26 @@ class RunSupervisor:
         # (start_date + elapsed * speed), where 0 means a frozen clock -- and
         # 0 here means the opposite, "do not pace the engine".
         env["AX_BACKTEST_PLAYBACK_SPEED"] = str(cfg.speed if cfg.speed > 0 else 1.0)
+        # How many days of prices the server loads. It has to be told: nothing
+        # passed --days along, so it used its .cjsys value (300) whatever the
+        # form asked for, and the overrun was silent -- the snapshot route
+        # cannot report having run out, so it repeated its last price for every
+        # bar past the end and the run reported on a flat feed.
+        #
+        # days + 1, and the +1 is load-bearing: the server snaps start_date to
+        # 09:00 and loads [start_date, start_date + N], so at N == --days the
+        # final day's session after 09:00 falls outside. Run 18 asked for 300
+        # against a 300-day server and still froze for all 233 bars of its
+        # last day.
+        #
+        # Via the environment because arenaxd has no such flag; load_cjsys
+        # loads its file with override=False, then reads os.environ, so this
+        # wins.
+        env["AX_BACKTEST_DURATION_DAYS"] = str(cfg.days + 1)
         self._children.append(self._spawn("broker", argv, env))
 
-    def _spawn_engine(self, cfg: RunConfig) -> None:
+    def _spawn_engine(self, cfg: RunConfig,
+                      roster_path: Optional[Path] = None) -> None:
         # Every field the form would ask for is passed as a flag, because the
         # engine's load_config() only skips prompting for fields whose flag is
         # present in argv. Miss one and the process blocks on stdin forever,
@@ -367,9 +471,16 @@ class RunSupervisor:
             # the server's own timeline origin" rather than inventing a date.
             f"--start-date={cfg.start_date}",
         ]
+        if roster_path is not None:
+            argv.append(f"--roster={roster_path}")
         env = dict(os.environ)
         env["CJ_ENGINE_STATUS_PORT"] = str(cfg.status_port)
         env["ARENAX_PORT"] = str(cfg.arenax_port)
+        # The control plane's capability. In the environment rather than argv
+        # because argv is visible to every process on the box through ps, and
+        # a token in ps is a token anyone can read. Without this the engine's
+        # write routes refuse outright -- see status_api's _authenticated.
+        env["CJ_ENGINE_CONTROL_TOKEN"] = self._control_token or ""
         # Unbuffered, so the log file is useful while the run is still going
         # instead of arriving in 8KB lumps.
         env["PYTHONUNBUFFERED"] = "1"
@@ -437,6 +548,12 @@ class RunSupervisor:
             for child in [c for c in self._children if c.name == name]:
                 stopped.append(await self._stop_child(child))
         self._children = []
+        # The capability dies with the run it was minted for, so a token
+        # learned from this run cannot be offered to the next engine. Cleared
+        # after the children are gone rather than before, because stopping
+        # them is the last thing it is needed for.
+        self._control_token = None
+        self._bot_strategies = {}
         return {"stopped": stopped}
 
     async def _stop_child(self, child: Child) -> dict:

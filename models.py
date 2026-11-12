@@ -37,6 +37,11 @@ class User(Base):
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String)
 
+    # Whether the starter strategies have been copied into this account.
+    # A flag rather than "seed when they have none", so deleting all of them
+    # is a decision that sticks instead of being undone on the next request.
+    examples_seeded = Column(Integer, default=0, nullable=False)
+
     runs = relationship("Run", back_populates="owner",
                         cascade="all, delete-orphan")
     manual_orders = relationship("ManualOrder", back_populates="owner",
@@ -194,6 +199,19 @@ class Strategy(Base):
     # them -- each check is a subprocess in the CJTrade checkout.
     last_check_ok = Column(Integer, nullable=True)      # 1 | 0 | null = never
     last_check_error = Column(String, nullable=True)
+    # Whether this strategy trades. Switching it off during a run stops its
+    # bot there and then -- the engine has a control plane for exactly this,
+    # because "it will not be in the next run" is no answer to finding a
+    # problem while money is moving. Switching it off between runs keeps it
+    # out of the next one.
+    #
+    # 1/0 rather than Boolean to match last_check_ok, which SQLite stores the
+    # same way anyway. Defaults to on: a strategy somebody just wrote and
+    # checked should run.
+    enabled = Column(Integer, default=1, nullable=False)
+    # Which template it started from, when it started from one. Kept so the
+    # examples can be seeded once and not re-seeded after being deleted.
+    seeded_from = Column(String, nullable=True)
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

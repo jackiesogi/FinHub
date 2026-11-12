@@ -379,18 +379,31 @@ function idleBotCard(b) {
         : b.check_ok === 0
         ? `<span class="text-red-500" title="${esc(b.check_error || 'has errors')}">●</span>`
         : '<span class="text-slate-300" title="not checked">●</span>';
-    const verdict = b.check_ok === 1 ? 'Checked and runnable'
+    /* Three reasons a strategy will not join the next run, and they need
+     * different fixes: switch it on, check it, or point the run at its
+     * symbol. "Idle" alone would not say which. */
+    const off = b.enabled === false;
+    const verdict = off ? 'Switched off — it will not join a run'
+        : b.check_ok === 1 ? 'Checked and runnable — joins the next run on its symbol'
         : b.check_ok === 0 ? (b.check_error || 'Has errors')
-        : 'Not checked yet';
+        : 'Not checked yet, so it will be left out of a run';
+    const control = off
+        ? `<button onclick="enableBotStrategy(${b.strategy_id}, event)"
+             class="text-[10px] font-bold text-emerald-700 bg-emerald-50 border border-emerald-100 px-2 py-1 rounded uppercase hover:bg-emerald-100">Enable</button>`
+        : `<button onclick="disableBotStrategy(${b.strategy_id}, ${JSON.stringify(b.name)}, event)"
+             class="text-[10px] font-bold text-slate-500 bg-slate-100 px-2 py-1 rounded uppercase hover:bg-slate-200">Disable</button>`;
     return `<div onclick="openStrategyFromBots(${b.strategy_id})"
-         class="bg-white p-5 rounded-2xl border border-dashed border-slate-300 shadow-sm hover:border-slate-400 cursor-pointer transition">
+         class="bg-white p-5 rounded-2xl border border-dashed border-slate-300 shadow-sm hover:border-slate-400 cursor-pointer transition ${off ? 'opacity-60' : ''}">
         <div class="flex justify-between items-start mb-3">
             <div class="min-w-0">
                 <div class="flex items-center gap-2">${dot}
                     <span class="font-black text-base truncate">${esc(b.name)}</span></div>
                 <p class="text-[10px] text-slate-400 font-bold uppercase ml-4">${esc(b.symbol)}</p>
             </div>
-            <span class="text-[10px] font-bold text-slate-400 uppercase shrink-0">Idle</span>
+            <div class="flex flex-col items-end gap-1 shrink-0">
+                <span class="text-[10px] font-bold ${off ? 'text-amber-600' : 'text-slate-400'} uppercase">${off ? 'Off' : 'Idle'}</span>
+                ${control}
+            </div>
         </div>
         <p class="text-[11px] text-slate-500 leading-snug">${esc(verdict)}</p>
         <p class="text-[10px] text-slate-400 mt-2 border-t border-slate-100 pt-2">
@@ -408,9 +421,20 @@ function liveBotCard(b) {
     const tiles = HEADLINE_MONITORS.filter(k => k in mon).map(k =>
         `<div><p class="text-[9px] font-bold text-slate-400 uppercase">${esc(k.replace(/_/g, ' '))}</p>
               <p class="text-sm font-bold tabular-nums">${esc(mon[k])}</p></div>`).join('');
-    const badge = b.kind === 'engine'
+    const stopped = s.stopped === true;
+    const badge = stopped
+        ? '<span class="text-[10px] font-bold text-amber-600 uppercase">Stopped</span>'
+        : b.kind === 'engine'
         ? '<span class="text-[10px] font-bold text-slate-400 uppercase">Built in</span>'
         : '<span class="text-[10px] font-bold text-emerald-600 uppercase">Live</span>';
+    /* Only a bot that came from one of your strategies can be switched off
+     * from here: the engine's built-in bots are not rows in this database, so
+     * there is nothing to set a flag on. */
+    const control = (b.strategy_id && !stopped)
+        ? `<button onclick="disableBotStrategy(${b.strategy_id}, ${JSON.stringify(b.name)}, event)"
+             class="text-[10px] font-bold text-red-600 bg-red-50 border border-red-100 px-2 py-1 rounded uppercase hover:bg-red-100"
+             title="Stops this bot now and cancels its resting orders. Does not sell what it holds.">Stop</button>`
+        : '';
     const subtitle = b.kind === 'engine'
         ? `bar ${int(s.bar_index)}`
         : `${esc(b.bot_id)} · bar ${int(s.bar_index)}`;
@@ -421,12 +445,14 @@ function liveBotCard(b) {
                 <span class="font-black text-base truncate">${esc(b.name)}</span>
                 <p class="text-[10px] text-slate-400 font-bold uppercase">${subtitle}</p>
             </div>
-            <div class="text-right shrink-0">
+            <div class="text-right shrink-0 flex flex-col items-end gap-1">
                 <p class="text-lg font-black tabular-nums">${num(s.balance, 0)}</p>
                 ${badge}
+                ${control}
             </div>
         </div>
         <div class="grid grid-cols-3 gap-2 mb-3">${tiles}</div>
+        ${stopped ? `<p class="text-[10px] font-bold text-amber-600 mb-2 normal-case">Stopped: ${esc(s.stopped_reason || 'by request')}. Its position was left alone.</p>` : ''}
         ${s.bars_dropped ? `<p class="text-[10px] font-bold text-amber-600 uppercase mb-2">${int(s.bars_dropped)} bar(s) dropped</p>` : ''}
         ${inflight.length ? `<p class="text-[10px] text-slate-500 mb-2">In flight: ${inflight.map(([k, v]) => `${esc(k)} ${esc(v)}`).join(', ')}</p>` : ''}
         ${mon.last_decision ? `<p class="text-[11px] text-slate-500 border-t border-slate-100 pt-2 leading-snug">${esc(mon.last_decision)}</p>` : ''}
@@ -436,6 +462,98 @@ function liveBotCard(b) {
 async function openStrategyFromBots(strategyId) {
     showSection('editor');
     await openStrategy(strategyId);
+}
+
+/* Switching a strategy off from the bots page, where you are most likely to
+ * be when you notice it misbehaving. Same endpoint as the editor's toggle. */
+async function disableBotStrategy(strategyId, name, event) {
+    if (event) event.stopPropagation();   // do not also open the editor
+    if (!confirm(`Switch "${name}" off?\n\n`
+                 + 'Its bot stops immediately if a run is going, and its '
+                 + 'resting orders are cancelled.\n\n'
+                 + 'It does NOT sell what the strategy already holds — that '
+                 + 'is a separate decision.')) {
+        return;
+    }
+    await setStrategyEnabled(strategyId, false);
+    loadBots();
+    loadStrategies();
+}
+
+async function enableBotStrategy(strategyId, event) {
+    if (event) event.stopPropagation();
+    await setStrategyEnabled(strategyId, true);
+    loadBots();
+    loadStrategies();
+}
+
+/* The one call behind every on/off control. Reports what actually happened:
+ * the flag always changes, and whether a live bot was stopped depends on
+ * whether one was running. */
+async function setStrategyEnabled(strategyId, enabled) {
+    let result;
+    try {
+        result = await api(`/api/v1/strategies/${strategyId}/enabled`, {
+            method: 'POST', body: JSON.stringify({enabled}),
+        });
+    } catch (e) {
+        toast(e.message, 'error');
+        return null;
+    }
+    if (result.error) {
+        /* The urgent half failed. Said loudly, because somebody who pressed
+         * this believes trading has stopped. */
+        toast(result.error, 'error');
+    } else if (result.stopped_now) {
+        toast(`Switched off — bot ${result.bot_id} stopped, position left alone`);
+    } else {
+        toast(enabled ? 'Enabled — it joins the next run'
+                      : 'Switched off — it was not running');
+    }
+    if (editorStrategy && editorStrategy.id === strategyId) {
+        editorStrategy.enabled = result.enabled;
+        setEnabledToggle(result.enabled);
+    }
+    return result;
+}
+
+function setEnabledToggle(enabled) {
+    const box = document.getElementById('editorEnabled');
+    const label = document.getElementById('editorEnabledLabel');
+    box.disabled = false;
+    box.checked = !!enabled;
+    label.textContent = enabled ? 'Enabled' : 'Disabled';
+    label.className = enabled ? '' : 'text-amber-600';
+}
+
+async function toggleEditorEnabled() {
+    if (!editorStrategy) return;
+    const wanted = document.getElementById('editorEnabled').checked;
+    if (!wanted && !confirm(
+            `Switch "${editorStrategy.name}" off?\n\n`
+            + 'Its bot stops immediately if a run is going, and its resting '
+            + 'orders are cancelled.\n\n'
+            + 'It does NOT sell what the strategy already holds.')) {
+        setEnabledToggle(true);
+        return;
+    }
+    await setStrategyEnabled(editorStrategy.id, wanted);
+    loadStrategies();
+    loadBots();
+}
+
+async function restoreExamples() {
+    try {
+        const body = await api('/api/v1/strategies/seed-examples',
+                               {method: 'POST'});
+        const made = body.created || [];
+        toast(made.length
+            ? `Restored ${made.map(s => s.name).join(', ')}`
+            : 'You already have all of them');
+        if (made.length) { loadStrategies(); loadBots(); }
+    } catch (e) {
+        toast(e.message, 'error');
+    }
 }
 
 function renderBotCards(bots, containerId) {
@@ -1089,10 +1207,12 @@ async function loadStrategies(selectId) {
             ? `<span class="text-red-500" title="${esc(s.last_check_error || 'has errors')}">●</span>`
             : '<span class="text-slate-300" title="not checked">●</span>';
         const active = editorStrategy && editorStrategy.id === s.id;
+        const off = s.enabled === false;
         return `<button onclick="openStrategy(${s.id})"
-            class="w-full text-left px-4 py-3 hover:bg-slate-50 transition ${active ? 'bg-slate-50' : ''}">
+            class="w-full text-left px-4 py-3 hover:bg-slate-50 transition ${active ? 'bg-slate-50' : ''} ${off ? 'opacity-50' : ''}">
             <div class="flex items-center gap-2">${mark}
-                <span class="font-bold text-sm truncate">${esc(s.name)}</span></div>
+                <span class="font-bold text-sm truncate">${esc(s.name)}</span>
+                ${off ? '<span class="text-[9px] font-bold text-amber-600 uppercase shrink-0">off</span>' : ''}</div>
             <div class="text-[11px] text-slate-400 mt-0.5 ml-4">${esc(s.symbol)}
                 · ${esc(shortTime(s.updated_at))}</div>
         </button>`;
@@ -1120,11 +1240,13 @@ async function openStrategy(id) {
     FinHubEditor.showDiagnostics(view, []);
     document.getElementById('editorTitle').textContent = s.name;
     document.getElementById('editorSubtitle').textContent =
-        `${s.symbol} · strategy #${s.id}`;
+        `${s.symbol} · strategy #${s.id}`
+        + (s.seeded_from ? ` · from the ${s.seeded_from} example` : '');
     document.getElementById('editorDirty').classList.add('hidden');
     document.getElementById('editorParams').classList.add('hidden');
     document.getElementById('editorDiagnostics').classList.add('hidden');
     setEditorButtons(true);
+    setEnabledToggle(s.enabled !== false);
     setEditorStatus(
         s.last_check_ok === 1 ? 'Checked and runnable.'
         : s.last_check_ok === 0 ? (s.last_check_error || 'Has errors.')
@@ -1261,22 +1383,41 @@ async function deleteStrategy() {
     loadBots();
 }
 
-/* The nearly-blank option. Kept here rather than in CJTrade because it
- * demonstrates nothing about the API — the starter template is the thing that
- * teaches, and that one is generated from the authoring module itself. */
-const BLANK_STRATEGY = `"""%NAME% — %SYMBOL%"""
-from cjtrade.pkgs.strategy.authoring import *
+/* The templates, from CJTrade. Loaded once per page: adding one over there
+ * changes this dropdown with no edit here. */
+let templatesLoaded = false;
 
+async function loadTemplates() {
+    if (templatesLoaded) return;
+    const select = document.getElementById('strategyTemplate');
+    try {
+        const body = await api('/api/v1/strategies/templates');
+        const list = body.templates || [];
+        if (!list.length) return;        // keep the hardcoded fallback option
+        select.innerHTML = list.map(t =>
+            `<option value="${esc(t.kind)}" data-note="${esc(t.note || '')}">
+                ${esc(t.label)}</option>`).join('');
+        templatesLoaded = true;
+        showTemplateNote();
+    } catch (e) {
+        /* The dropdown keeps its one fallback entry, so a new strategy is
+         * still possible without the list. */
+        console.warn('could not load the templates:', e.message);
+    }
+}
 
-def on_bar(bar, account):
-    watch(price=bar.close)
-    return hold("nothing decided yet")
-`;
+function showTemplateNote() {
+    const select = document.getElementById('strategyTemplate');
+    const option = select.options[select.selectedIndex];
+    document.getElementById('strategyTemplateNote').textContent =
+        (option && option.dataset.note) || '\u00a0';
+}
 
-function openStrategyModal() {
+async function openStrategyModal() {
     document.getElementById('strategyFormError').textContent = '';
     document.getElementById('strategyModal').classList.add('active');
     document.getElementById('strategyName').focus();
+    await loadTemplates();
 }
 
 function closeStrategyModal() {
@@ -1295,15 +1436,10 @@ async function submitStrategy(event) {
     btn.disabled = true;
     btn.textContent = 'Creating…';
     try {
-        const body = {name, symbol};
-        if (kind === 'blank') {
-            body.source = BLANK_STRATEGY
-                .replace('%NAME%', name).replace('%SYMBOL%', symbol);
-        }
-        /* source omitted for 'starter': the server fills it in from CJTrade's
-         * own template, which is generated next to the API it demonstrates. */
+        /* No source: the server fills it in from CJTrade's own template for
+         * this kind, which is generated next to the API it demonstrates. */
         const created = await api('/api/v1/strategies', {
-            method: 'POST', body: JSON.stringify(body),
+            method: 'POST', body: JSON.stringify({name, symbol, kind}),
         });
         closeStrategyModal();
         await loadStrategies(created.id);

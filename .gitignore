@@ -20,6 +20,9 @@ Thumbs.db
 # --- [PROJECT ARTIFACTS & LOGS] ---
 # Captured stdout/stderr of the runs FinHub started.
 run_logs/
+# Per-run copies of strategy source, written when a run starts. Build
+# artifacts of a run, not source: the record lives in the database.
+run_strategies/
 archive/
 *.log
 .pytest_cache/
