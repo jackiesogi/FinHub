@@ -649,39 +649,131 @@ async function loadBotHistory(botId) {
     </tr>`).join('');
 }
 
+/* Colours for whatever a strategy decided to plot. Assigned by position so the
+ * same series keeps its colour across polls, and two of them are never the
+ * same shade of grey. Price is not in here: it has its own. */
+const PLOT_COLOURS = ['#2563eb', '#0f172a', '#7c3aed', '#059669', '#d97706',
+                      '#db2777', '#0891b2'];
+
+/* The span of a series, ignoring the nulls a warm-up leaves behind. */
+function spanOf(values) {
+    const numbers = values.filter(v => typeof v === 'number' && isFinite(v));
+    if (!numbers.length) return null;
+    return { lo: Math.min(...numbers), hi: Math.max(...numbers) };
+}
+
+/* Does this series belong on the price axis?
+ *
+ * By whether its range overlaps the price's, not by comparing midpoints. A
+ * band, a moving average or a breakout level sits inside or beside the price;
+ * an oscillator (RSI 0-100, a trend strength) does not come near it. Comparing
+ * midpoints with a ratio got RSI right only by luck — at 50 against a 254
+ * stock it just cleared the cutoff, and the same strategy on a 60 ETF would
+ * have flattened the price into a line.
+ *
+ * The margin widens the price range by a tenth of its own height, so a band
+ * that sits just outside the high and low still shares the axis instead of
+ * being exiled for a rounding error. */
+function sharesPriceAxis(series, price) {
+    if (!series || !price) return true;
+    const pad = Math.max((price.hi - price.lo) * 0.1, Math.abs(price.hi) * 0.01);
+    return series.hi >= price.lo - pad && series.lo <= price.hi + pad;
+}
+
 function drawBotChart(rows) {
     const ctx = document.getElementById('botChart');
     if (!ctx) return;
     const labels = rows.map(r => int(r.bar_index));
-    /* Bands and price if the strategy reports them; balance otherwise. Chosen
-     * from what the monitors actually contain rather than assumed, so a
-     * non-Bollinger strategy still gets a readable chart. */
-    const has = k => rows.some(r => (r.monitors || {})[k] !== undefined);
-    const series = [];
-    if (has('upper') && has('lower')) {
-        series.push({ key: 'upper', colour: '#94a3b8' },
-                    { key: 'middle', colour: '#0f172a' },
-                    { key: 'lower', colour: '#94a3b8' });
-    } else {
-        series.push({ key: null, colour: '#0f172a' });
-    }
-    const datasets = series.map(s => ({
-        label: s.key || 'balance',
-        data: rows.map(r => s.key ? (r.monitors || {})[s.key] : r.balance),
-        borderColor: s.colour, borderWidth: s.key === 'middle' ? 2 : 1,
-        pointRadius: 0, fill: false, tension: 0.1,
-        borderDash: s.key === 'upper' || s.key === 'lower' ? [4, 3] : [],
+
+    /* The price is always drawn. It comes from the bot, which is the process
+     * that turned master's broadcast into the bar its strategy saw, so it is
+     * the price the decisions were actually made against — not whatever the
+     * broker would answer now. An indicator chart with no price to read the
+     * indicators against is not a chart. */
+    const closes = rows.map(r => (typeof r.close === 'number' && r.close > 0)
+                                 ? r.close : null);
+    const havePrice = closes.some(v => v !== null);
+
+    /* Then whatever the strategy asked for, by name. Collected across the
+     * whole window rather than from the last row, so a series that only
+     * exists in one regime (the ADX strategy swaps its levels) does not
+     * flicker in and out of the legend. */
+    const plotKeys = [];
+    rows.forEach(r => Object.keys(r.plots || {}).forEach(k => {
+        if (!plotKeys.includes(k)) plotKeys.push(k);
     }));
+
+    /* Older bots, and the engine's built-in BaseStrategy bots before they
+     * grew plots(), report their bands as monitors instead. Picked up so
+     * their chart is no worse than it was. */
+    if (!plotKeys.length) {
+        ['upper', 'middle', 'lower', 'high', 'low', 'avg_cost'].forEach(k => {
+            if (rows.some(r => typeof (r.monitors || {})[k] === 'number')) {
+                plotKeys.push(k);
+            }
+        });
+    }
+
+    const priceSpan = spanOf(closes);
+    const datasets = [];
+    let needsRightAxis = false;
+
+    if (havePrice) {
+        datasets.push({
+            label: 'close', data: closes, yAxisID: 'y',
+            borderColor: '#94a3b8', backgroundColor: 'rgba(148,163,184,0.12)',
+            borderWidth: 2, pointRadius: 0, fill: true, tension: 0.1,
+            order: 10,          // drawn behind the indicator lines
+        });
+    }
+
+    plotKeys.forEach((key, i) => {
+        const data = rows.map(r => {
+            const v = (r.plots || {})[key];
+            if (typeof v === 'number') return v;
+            const m = (r.monitors || {})[key];
+            return typeof m === 'number' ? m : null;
+        });
+        /* An oscillator on the price axis would flatten the price into a line.
+         * Anything whose range does not reach the price gets the right-hand
+         * axis, so a strategy author can plot one without knowing that. */
+        const offScale = havePrice
+            && !sharesPriceAxis(spanOf(data), priceSpan);
+        if (offScale) needsRightAxis = true;
+        datasets.push({
+            label: key, data, yAxisID: offScale ? 'y2' : 'y',
+            borderColor: PLOT_COLOURS[i % PLOT_COLOURS.length],
+            borderWidth: 1.5, pointRadius: 0, fill: false, tension: 0.1,
+            borderDash: offScale ? [] : [4, 3],
+            spanGaps: true,     // a warm-up gap is a gap, not a drop to zero
+        });
+    });
+
+    if (!datasets.length) {
+        /* Nothing to draw rather than a misleading line: before the first
+         * report there is no price and no indicator. */
+        datasets.push({ label: 'waiting for the first bar', data: [],
+                        borderColor: '#cbd5e1' });
+    }
+
+    const scales = {
+        x: { ticks: { maxTicksLimit: 12, font: { size: 9 } },
+             grid: { display: false } },
+        y: { position: 'left', ticks: { font: { size: 9 } },
+             grid: { color: '#f1f5f9' } },
+    };
+    if (needsRightAxis) {
+        scales.y2 = { position: 'right', ticks: { font: { size: 9 } },
+                      grid: { display: false } };
+    }
+
     if (botChart) { botChart.destroy(); }
     botChart = new Chart(ctx, {
         type: 'line', data: { labels, datasets },
         options: {
             responsive: true, maintainAspectRatio: false, animation: false,
             plugins: { legend: { labels: { font: { size: 10 }, boxWidth: 12 } } },
-            scales: {
-                x: { ticks: { maxTicksLimit: 12, font: { size: 9 } }, grid: { display: false } },
-                y: { ticks: { font: { size: 9 } }, grid: { color: '#f1f5f9' } },
-            },
+            scales,
             interaction: { mode: 'index', intersect: false },
         },
     });

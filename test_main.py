@@ -1066,3 +1066,33 @@ def test_a_checkout_that_cannot_make_templates_does_not_block_registering(
         "username": name, "email": f"{name}@example.com",
         "password": "a-long-enough-password"})
     assert res.status_code == 200, res.text
+
+
+# ── the price on the bot chart ───────────────────────────────────────────────
+#
+# The chart draws whatever a strategy asked to have plotted, and the price
+# underneath it always. Indicator values with no price to read them against
+# are unreadable, and the bot is the process that has the number the strategy
+# actually saw -- FinHub only has to not drop it.
+
+
+def test_the_price_reaches_the_bots_page(client, authed, monkeypatch):
+    _fake_live(monkeypatch, {"Bot_S1": {
+        "bar_index": 42, "balance": 99_000.0, "close": 254.5,
+        "plots": {"upper": 255.0, "lower": 254.0},
+        "monitors": {"last_decision": "inside the bands"}}})
+    entry = next(b for b in client.get("/api/v1/bots", headers=authed).json()
+                 ["bots"] if b["bot_id"] == "Bot_S1")
+    assert entry["status"]["close"] == 254.5
+    assert entry["status"]["plots"] == {"upper": 255.0, "lower": 254.0}
+
+
+def test_an_engine_that_reports_no_price_is_not_invented(client, authed,
+                                                         monkeypatch):
+    """A bot that has not seen a bar has no price, and a zero would be drawn
+    as a real one. The page has to be able to tell the difference."""
+    _fake_live(monkeypatch, {"Bot_S1": {"bar_index": 0, "balance": 1.0,
+                                        "monitors": {}}})
+    entry = next(b for b in client.get("/api/v1/bots", headers=authed).json()
+                 ["bots"] if b["bot_id"] == "Bot_S1")
+    assert "close" not in entry["status"] or not entry["status"]["close"]
